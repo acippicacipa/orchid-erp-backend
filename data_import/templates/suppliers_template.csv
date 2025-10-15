@@ -1,0 +1,4 @@
+name,supplier_id,email,phone,contact_person,tax_id,payment_terms,currency,notes
+PT Bunga Indah,SUP001,info@bungaindah.com,021-12345678,John Doe,01.234.567.8-901.000,Net 30 days,IDR,Main flower supplier
+CV Daun Segar,SUP002,contact@daunsegar.com,021-87654321,Jane Smith,02.345.678.9-012.000,Net 15 days,IDR,Leaf and foliage supplier
+Toko Aksesoris Cantik,SUP003,sales@aksesorisc.com,021-11223344,Bob Johnson,03.456.789.0-123.000,Cash on delivery,IDR,Decorative accessories supplier
