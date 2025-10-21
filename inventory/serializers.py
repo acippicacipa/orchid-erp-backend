@@ -3,6 +3,7 @@ from .models import (
     MainCategory, SubCategory, Category, Location, Product, Stock, 
     BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem
 )
+from django.db import models
 
 class MainCategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -85,17 +86,18 @@ class BOMItemSerializer(serializers.ModelSerializer):
 class BillOfMaterialsSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
-    
+    product_color = serializers.CharField(source='product.color', read_only=True, allow_blank=True)
+
     bom_items = BOMItemSerializer(many=True)
 
     class Meta:
         model = BillOfMaterials
         fields = [
-            'id', 'product', 'product_name', 'product_sku', 'bom_number',
+            'id', 'product', 'product_name', 'product_sku', 'product_color', 'bom_number',
             'version', 'is_default', 'bom_items', 
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['bom_number', 'product_name', 'product_sku']
+        read_only_fields = ['bom_number', 'product_name', 'product_sku', 'product_color']
 
     # Override 'to_representation' untuk menampilkan detail saat membaca
     def to_representation(self, instance):
@@ -140,15 +142,86 @@ class AssemblyOrderItemSerializer(serializers.ModelSerializer):
 
 class AssemblyOrderSerializer(serializers.ModelSerializer):
     bom_number = serializers.CharField(source='bom.bom_number', read_only=True, allow_null=True)
-    product_name = serializers.CharField(source='bom.product.name', read_only=True, allow_null=True)
+    product_name = serializers.CharField(source='product.name', read_only=True, allow_null=True)
+    product_color = serializers.CharField(source='product.color', read_only=True, allow_null=True)
     items = AssemblyOrderItemSerializer(many=True, read_only=True)
+    production_location_name = serializers.CharField(source='production_location.name', read_only=True, allow_null=True)
 
     class Meta:
         model = AssemblyOrder
         fields = [
-            'id', 'bom', 'bom_number', 'product_name', 'quantity',
-            'order_date', 'notes', 'items', 'created_at', 'updated_at'
+            'id', 
+            'order_number',
+            'product',          # Kirim ID Product ke sini
+            'product_name', 'product_color',
+            'bom',              # Kirim ID BOM ke sini
+            'bom_number',
+            'quantity',
+            'quantity_produced',
+            'production_location', # <-- INI FIELD YANG HARUS DIKIRIM DARI FRONTEND
+            'production_location_name',
+            'status',
+            'priority',
+            'order_date',
+            'planned_start_date',
+            'planned_completion_date',
+            'description',
+            'notes',
+            'special_instructions',
+            'assigned_to',
+            'items'
         ]
+        read_only_fields = ['order_number', 'product_name', 'bom_number', 'production_location_name']
+
+    def create(self, validated_data):
+        # Ambil data BOM dan kuantitas dari data yang sudah divalidasi
+        bom = validated_data.get('bom')
+        quantity_to_produce = validated_data.get('quantity')
+
+        # Buat AssemblyOrder terlebih dahulu
+        assembly_order = AssemblyOrder.objects.create(**validated_data)
+
+        # Jika ada BOM dan kuantitas, buat item-itemnya
+        if bom and quantity_to_produce > 0:
+            # Ambil semua item dari BOM yang dipilih
+            bom_items = bom.bom_items.all()
+
+            # Loop melalui setiap item di BOM
+            for bom_item in bom_items:
+                # Hitung kuantitas komponen yang dibutuhkan
+                required_quantity = bom_item.quantity * quantity_to_produce
+
+                # Buat record AssemblyOrderItem
+                AssemblyOrderItem.objects.create(
+                    assembly_order=assembly_order,
+                    component=bom_item.component,
+                    quantity=required_quantity
+                )
+        
+        return assembly_order
+
+    # (Opsional) Anda juga bisa meng-override 'update' jika ingin logika yang sama saat mengedit
+    def update(self, instance, validated_data):
+        # Panggil update standar dari parent class
+        instance = super().update(instance, validated_data)
+
+        # Logika untuk meng-update item jika BOM atau kuantitas berubah
+        bom = validated_data.get('bom', instance.bom)
+        quantity_to_produce = validated_data.get('quantity', instance.quantity)
+
+        # Hapus item lama dan buat yang baru (cara paling sederhana)
+        instance.items.all().delete()
+
+        if bom and quantity_to_produce > 0:
+            for bom_item in bom.bom_items.all():
+                required_quantity = bom_item.quantity * quantity_to_produce
+                AssemblyOrderItem.objects.create(
+                    assembly_order=instance,
+                    component=bom_item.component,
+                    quantity=required_quantity
+                )
+        
+        return instance
 
 # Import additional models for goods receipt
 from .models import GoodsReceipt, GoodsReceiptItem, StockMovement
@@ -190,13 +263,15 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(source='supplier.name', read_only=True, allow_null=True)
     received_by_name = serializers.CharField(source='received_by.username', read_only=True)
     location_name = serializers.CharField(source='location.name', read_only=True, allow_null=True)
+    assembly_order_number = serializers.CharField(source='assembly_order.order_number', read_only=True, allow_null=True)
     
     class Meta:
         model = GoodsReceipt
         fields = [
-            'id', 'receipt_number', 'purchase_order', 'purchase_order_number',
-            'supplier', # <-- Tambahkan ID supplier
-            'supplier_name', # <-- Nama supplier akan berfungsi untuk kedua mode
+            'id', 'receipt_number', 
+            'purchase_order', 'purchase_order_number',
+            'assembly_order', 'assembly_order_number', # <-- Tambahkan di sini
+            'supplier', 'supplier_name', 
             'receipt_date', 'received_by', 'received_by_name',
             'status', 'notes', 'location', 'location_name', 
             'items', 'created_at', 'updated_at'
@@ -209,6 +284,7 @@ class CreateGoodsReceiptSerializer(serializers.ModelSerializer):
         model = GoodsReceipt
         fields = [
             'purchase_order',
+            'assembly_order', # <-- Tambahkan field baru
             'supplier', 
             'location',
             'received_by', 
@@ -217,7 +293,8 @@ class CreateGoodsReceiptSerializer(serializers.ModelSerializer):
         ]
         extra_kwargs = {
             'purchase_order': {'required': False, 'allow_null': True},
-            'supplier': {'required': False, 'allow_null': True}, # <-- Tambahkan ini
+            'assembly_order': {'required': False, 'allow_null': True}, # <-- Buat opsional
+            'supplier': {'required': False, 'allow_null': True},
             'location': {'required': True},
             'received_by': {'write_only': True}
         }
@@ -228,7 +305,6 @@ class CreateGoodsReceiptSerializer(serializers.ModelSerializer):
         po = validated_data.get('purchase_order')
         if po and not validated_data.get('supplier'):
              validated_data['supplier'] = po.supplier
-        # -------------------------------------------
 
         goods_receipt = GoodsReceipt.objects.create(**validated_data)
         
@@ -294,3 +370,27 @@ class StockMovementSerializer(serializers.ModelSerializer):
             'user': {'write_only': True},
             'created_by': {'write_only': True, 'required': False},
         }
+
+class AssemblyOrderForReceiptSerializer(serializers.ModelSerializer):
+    """Serializer untuk menampilkan Assembly Orders yang siap diterima."""
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+    # Menghitung sisa kuantitas yang belum diterima
+    quantity_remaining = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AssemblyOrder
+        fields = [
+            'id', 'order_number', 'product', 'product_name', 'product_sku', 
+            'quantity', 'quantity_produced', 'quantity_remaining', 'production_location'
+        ]
+
+    def get_quantity_remaining(self, obj):
+        # Hitung total yang sudah diterima melalui GoodsReceipts
+        total_received = obj.goods_receipts.filter(status='CONFIRMED').aggregate(
+            total=models.Sum('items__quantity_received')
+        )['total'] or 0
+        
+        # Sisa adalah jumlah yang sudah diproduksi dikurangi yang sudah diterima
+        remaining = obj.quantity_produced - total_received
+        return remaining if remaining > 0 else 0
