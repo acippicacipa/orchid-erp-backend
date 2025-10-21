@@ -2,6 +2,7 @@ from django.utils import timezone
 from django.db import models
 from django.conf import settings
 from common.models import BaseModel
+from datetime import date
 
 class MainCategory(models.Model):
     """
@@ -131,7 +132,7 @@ class Product(BaseModel):
     cost_price = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
     selling_price = models.DecimalField(max_digits=10, decimal_places=2)
     unit_of_measure = models.CharField(max_length=50, default="pcs")
-    weight = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
+    weight = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
     dimensions = models.CharField(max_length=100, blank=True, null=True, help_text="L x W x H")
     
     is_active = models.BooleanField(default=True)
@@ -183,14 +184,14 @@ class Stock(BaseModel):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="stock_levels")
     location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name="stock_items")
     
-    quantity_on_hand = models.DecimalField(max_digits=12, decimal_places=3, default=0.00)
-    quantity_sellable = models.DecimalField(max_digits=12, decimal_places=3, default=0.00)
-    quantity_non_sellable = models.DecimalField(max_digits=12, decimal_places=3, default=0.00)
-    quantity_reserved = models.DecimalField(max_digits=12, decimal_places=3, default=0.00)
-    quantity_allocated = models.DecimalField(max_digits=12, decimal_places=3, default=0.00)
+    quantity_on_hand = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    quantity_sellable = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    quantity_non_sellable = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    quantity_reserved = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    quantity_allocated = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
     
-    average_cost = models.DecimalField(max_digits=12, decimal_places=4, default=0.00)
-    last_cost = models.DecimalField(max_digits=12, decimal_places=4, default=0.00)
+    average_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    last_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
     
     last_received_date = models.DateTimeField(null=True, blank=True)
     last_sold_date = models.DateTimeField(null=True, blank=True)
@@ -294,10 +295,10 @@ class AssemblyOrder(BaseModel):
     bom = models.ForeignKey(BillOfMaterials, on_delete=models.SET_NULL, null=True, blank=True)
     
     # Kuantitas yang akan diproduksi
-    quantity = models.DecimalField(max_digits=12, decimal_places=3)
+    quantity = models.DecimalField(max_digits=12, decimal_places=2)
     
     # Kuantitas yang sudah selesai diproduksi
-    quantity_produced = models.DecimalField(max_digits=12, decimal_places=3, default=0.000)
+    quantity_produced = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
 
     # Lokasi produksi
     production_location = models.ForeignKey(Location, on_delete=models.SET_NULL, null=True, blank=True, limit_choices_to={'is_manufacturing_location': True})
@@ -307,7 +308,7 @@ class AssemblyOrder(BaseModel):
     priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='NORMAL', db_index=True)
 
     # Tanggal-tanggal penting
-    order_date = models.DateField(default=timezone.now)
+    order_date = models.DateField(default=date.today)
     planned_start_date = models.DateField(null=True, blank=True)
     planned_completion_date = models.DateField(null=True, blank=True)
     actual_start_date = models.DateTimeField(null=True, blank=True)
@@ -371,6 +372,16 @@ class GoodsReceipt(BaseModel):
         blank=True, 
         related_name='goods_receipts'
     )
+    
+    assembly_order = models.ForeignKey(
+        'AssemblyOrder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='goods_receipts',
+        help_text="Sumber penerimaan barang dari hasil produksi."
+    )
+
     supplier = models.ForeignKey(
         'purchasing.Supplier',
         on_delete=models.SET_NULL,
@@ -419,9 +430,9 @@ class GoodsReceiptItem(BaseModel):
         blank=True                 # Izinkan field ini kosong di form/serializer Django
     )
     product = models.ForeignKey(Product, on_delete=models.CASCADE)
-    quantity_ordered = models.DecimalField(max_digits=12, decimal_places=3)
-    quantity_received = models.DecimalField(max_digits=12, decimal_places=3)
-    unit_price = models.DecimalField(max_digits=12, decimal_places=4)
+    quantity_ordered = models.DecimalField(max_digits=12, decimal_places=2)
+    quantity_received = models.DecimalField(max_digits=12, decimal_places=2)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     batch_number = models.CharField(max_length=100, blank=True, null=True)
     expiry_date = models.DateField(null=True, blank=True)
     notes = models.TextField(blank=True, null=True)
@@ -477,8 +488,8 @@ class StockMovement(BaseModel):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='movements')
     location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='movements')
     movement_type = models.CharField(max_length=20, choices=MOVEMENT_TYPES)
-    quantity = models.DecimalField(max_digits=12, decimal_places=3)
-    unit_cost = models.DecimalField(max_digits=12, decimal_places=4, default=0)
+    quantity = models.DecimalField(max_digits=12, decimal_places=2)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     reference_number = models.CharField(max_length=100, blank=True, null=True)
     reference_type = models.CharField(max_length=50, blank=True, null=True)  # 'GOODS_RECEIPT', 'SALES_ORDER', etc.
     notes = models.TextField(blank=True, null=True)
