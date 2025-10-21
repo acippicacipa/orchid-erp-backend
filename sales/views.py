@@ -7,21 +7,35 @@ from django.utils import timezone
 from datetime import datetime, timedelta
 from accounts.permissions import IsAdminOrSales
 from rest_framework.permissions import AllowAny
-from .models import Customer, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage
+from .services import PricingService
+from .models import Customer, CustomerGroup, Product, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage
 from .serializers import (
-    CustomerSerializer, CustomerListSerializer,
+    CustomerSerializer, CustomerListSerializer, CustomerGroupSerializer,
     SalesOrderSerializer, SalesOrderListSerializer, SalesOrderItemSerializer,
     InvoiceSerializer, InvoiceListSerializer, PaymentSerializer,
     ProductSearchSerializer, DownPaymentSerializer, DownPaymentUsageSerializer,
     CustomerDownPaymentSummarySerializer
 )
 from inventory.models import Product
+from decimal import Decimal, InvalidOperation
+
+class CustomerGroupViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet untuk mengelola grup customer.
+    """
+    queryset = CustomerGroup.objects.all()
+    serializer_class = CustomerGroupSerializer
+    permission_classes = [IsAdminOrSales]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name', 'description']
+    ordering_fields = ['name']
+    ordering = ['name']
 
 class CustomerViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing customers with search and filtering
     """
-    queryset = Customer.objects.all()
+    queryset = Customer.objects.select_related('customer_group').all()
     permission_classes = [IsAdminOrSales]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_active', 'city', 'state', 'country']
@@ -95,11 +109,49 @@ class ProductSearchViewSet(viewsets.ReadOnlyModelViewSet):
             Q(name__icontains=query) |
             Q(sku__icontains=query) |
             Q(description__icontains=query),
-            is_active=True
-        ).select_related('category').order_by('name')[:20]
+            is_active=True,
+            is_sellable=True # Pastikan hanya produk yang bisa dijual yang muncul
+        ).select_related('main_category', 'sub_category').order_by('name')[:20]
         
         serializer = ProductSearchSerializer(products, many=True)
         return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'], url_path='calculate-price')
+    def calculate_price(self, request, pk=None):
+        """
+        Calculates the price and discount for a product based on customer and quantity.
+        Expects 'customer_id' and 'quantity' as query parameters.
+        """
+        product = self.get_object()
+        
+        customer_id = request.query_params.get('customer_id')
+        quantity_str = request.query_params.get('quantity', '1')
+
+        if not customer_id:
+            return Response(
+                {'error': 'customer_id is required'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            customer = Customer.objects.get(pk=customer_id)
+        except Customer.DoesNotExist:
+            return Response({'error': f"Customer with ID {customer_id} not found"}, status=status.HTTP_404_NOT_FOUND)
+        except (ValueError, TypeError):
+             return Response({'error': 'Invalid customer_id format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 2. Validasi Kuantitas secara terpisah
+        try:
+            quantity = Decimal(quantity_str)
+            if quantity <= 0:
+                raise InvalidOperation("Quantity must be positive.")
+        except InvalidOperation as e: # Tangkap error konversi Decimal secara spesifik
+            return Response({'error': f"Invalid quantity: {e}"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Jika semua validasi lolos, panggil service
+        pricing_data = PricingService.get_price_and_discount(customer, product, quantity)
+        
+        return Response(pricing_data)
 
 class SalesOrderViewSet(viewsets.ModelViewSet):
     """

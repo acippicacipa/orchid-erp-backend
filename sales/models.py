@@ -5,6 +5,43 @@ from common.models import BaseModel, Address, Contact
 from accounts.models import UserProfile
 from inventory.models import Product
 
+def get_default_customer_group_id():
+    """
+    Mencari dan mengembalikan ID dari CustomerGroup 'Walk In'.
+    Mengembalikan None jika tidak ditemukan untuk menghindari error saat migrasi awal.
+    """
+    try:
+        # Gunakan .get() untuk mendapatkan objeknya.
+        # Jika tidak ada, ini akan melempar DoesNotExist.
+        walk_in_group = CustomerGroup.objects.get(name='Walk In')
+        return walk_in_group.id
+    except CustomerGroup.DoesNotExist:
+        # Jika grup belum ada (misalnya saat migrasi pertama kali), kembalikan None.
+        return None
+        
+class CustomerGroup(models.Model):
+    """
+    Model untuk mengkategorikan customer, misal: Grosir, Retail, dll.
+    """
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+    description = models.TextField(blank=True, null=True)
+    discount_percentage = models.DecimalField(
+        max_digits=5, 
+        decimal_places=2, 
+        default=0.00, 
+        help_text="Default discount percentage for this group"
+    )
+    
+    class Meta:
+        verbose_name = "Customer Group"
+        verbose_name_plural = "Customer Groups"
+        db_table = "sales_customer_groups"
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
 class Customer(BaseModel):
     """
     Customer model for managing customer information
@@ -28,11 +65,19 @@ class Customer(BaseModel):
     company_name = models.CharField(max_length=255, blank=True, null=True, help_text="Company name")
     tax_id = models.CharField(max_length=50, blank=True, null=True, help_text="Tax ID/NPWP")
     
+    customer_group = models.ForeignKey(
+        CustomerGroup, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True, 
+        related_name='customers',
+        help_text="Customer group for pricing and discounts",
+        default=get_default_customer_group_id
+    )
+
     # Customer settings
-    customer_group = models.ForeignKey('CustomerGroup', on_delete=models.SET_NULL, null=True, blank=True, help_text="Customer group for pricing and discounts")
     credit_limit = models.DecimalField(max_digits=15, decimal_places=2, default=0.00, help_text="Credit limit in IDR")
     payment_terms = models.CharField(max_length=100, default='Net 30 days', help_text="Payment terms")
-    discount_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=0.00, help_text="Default discount percentage")
     
     # Status and notes
     is_active = models.BooleanField(default=True, help_text="Is customer active")
@@ -453,10 +498,3 @@ class DownPaymentUsage(BaseModel):
             self.down_payment.status = "USED"
         
         self.down_payment.save()
-
-
-# Import discount models
-from .discount_models import (
-    CustomerGroup, ProductDiscount, QuantityDiscount, 
-    WholesalerDiscount, DiscountCalculationService
-)

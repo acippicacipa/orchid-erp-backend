@@ -1,29 +1,65 @@
 from rest_framework import serializers
 from decimal import Decimal
-from .models import Customer, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage
-from inventory.models import Product
+from django.db.models import Sum
+from .models import Customer, CustomerGroup, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage
+from inventory.models import Product, Stock
+
+class CustomerGroupSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CustomerGroup
+        fields = ['id', 'name', 'description', 'discount_percentage']
 
 class CustomerSerializer(serializers.ModelSerializer):
     full_address = serializers.ReadOnlyField()
-    
+    customer_group_name = serializers.CharField(source='customer_group.name', read_only=True, allow_null=True)
+    group_discount_percentage = serializers.DecimalField(
+        source='customer_group.discount_percentage', 
+        read_only=True, 
+        max_digits=5, 
+        decimal_places=2,
+        allow_null=True
+    )
+
     class Meta:
         model = Customer
-        fields = '__all__'
+        # Tambahkan 'customer_group_name' ke fields
+        fields = [
+            'id', 'name', 'customer_id', 'email', 'phone', 'mobile', 
+            'address_line_1', 'address_line_2', 'city', 'state', 'postal_code', 'country',
+            'contact_person', 'company_name', 'tax_id', 
+            'customer_group', 'customer_group_name', 'group_discount_percentage',
+            'credit_limit', 'payment_terms',
+            'is_active', 'notes', 'full_address',
+            'created_at', 'updated_at', 'created_by', 'updated_by'
+        ]
         read_only_fields = ('created_at', 'updated_at', 'created_by', 'updated_by')
-
-    def validate_email(self, value):
-        if value and Customer.objects.filter(email=value).exclude(pk=self.instance.pk if self.instance else None).exists():
-            raise serializers.ValidationError("Customer with this email already exists.")
-        return value
 
 class ProductSearchSerializer(serializers.ModelSerializer):
     """Serializer for product search in sales orders"""
-    category_name = serializers.CharField(source='category.name', read_only=True)
-    stock_quantity = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    category_path = serializers.CharField(read_only=True)
+    stock_quantity = serializers.SerializerMethodField()
     
     class Meta:
         model = Product
-        fields = ['id', 'name', 'sku', 'price', 'category_name', 'stock_quantity', 'unit']
+        # Sesuaikan fields dengan yang dibutuhkan frontend
+        fields = [
+            'id', 
+            'name', 
+            'sku', 
+            'selling_price', # Frontend butuh ini
+            'category_path', # Ganti dari category_name
+            'stock_quantity',
+            'is_sellable', # Tambahkan ini untuk filtering di frontend jika perlu
+            'unit_of_measure' # Ganti dari 'unit'
+        ]
+
+    def get_stock_quantity(self, obj):
+        # Ambil total stok yang bisa dijual dari semua lokasi
+        # Ini mungkin perlu disesuaikan jika Anda ingin stok dari lokasi tertentu
+        total_sellable = Stock.objects.filter(product=obj).aggregate(
+            total=Sum('quantity_sellable')
+        )['total'] or 0
+        return total_sellable
 
 class SalesOrderItemSerializer(serializers.ModelSerializer):
     product_name = serializers.ReadOnlyField()
@@ -239,10 +275,21 @@ class SalesOrderListSerializer(serializers.ModelSerializer):
         return f"Rp {obj.total_amount:,.0f}"
 
 class CustomerListSerializer(serializers.ModelSerializer):
+    customer_group_name = serializers.CharField(source='customer_group.name', read_only=True, allow_null=True)
     """Simplified serializer for customer lists"""
     class Meta:
         model = Customer
-        fields = ['id', 'name', 'customer_id', 'email', 'phone', 'city', 'is_active']
+        fields = [
+            'id', 
+            'name', 
+            'customer_id', 
+            'email', 
+            'phone', 
+            'city', 
+            'is_active',
+            'customer_group', # ID dari grup
+            'customer_group_name' # Nama dari grup
+        ]
 
 class InvoiceListSerializer(serializers.ModelSerializer):
     """Simplified serializer for invoice lists"""
