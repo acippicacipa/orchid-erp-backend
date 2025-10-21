@@ -3,11 +3,14 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import AllowAny
-from django.db.models import Q, F
+from django.db.models import Q, F, Sum
 from accounts.permissions import IsAdminOrWarehouse
-from django.db import transaction
+from django.db import transaction, models
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from purchasing.models import PurchaseOrder, PurchaseOrderItem
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta
 from .models import (
     MainCategory, SubCategory, Category, Location, Product, Stock, 
     BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockMovement, GoodsReceipt, GoodsReceiptItem
@@ -17,7 +20,7 @@ from .serializers import (
     LocationSerializer, ProductSerializer, StockSerializer,
     BillOfMaterialsSerializer, BOMItemSerializer, 
     AssemblyOrderSerializer, AssemblyOrderItemSerializer, StockMovementSerializer, GoodsReceiptSerializer, CreateGoodsReceiptSerializer, 
-    PurchaseOrderForReceiptSerializer
+    PurchaseOrderForReceiptSerializer, AssemblyOrderForReceiptSerializer
 )
 
 class MainCategoryViewSet(viewsets.ModelViewSet):
@@ -196,9 +199,80 @@ class StockViewSet(viewsets.ModelViewSet):
         
         return Response({'summary': list(summary)})
 
-    # ==============================================================================
-    # 2. TAMBAHKAN CUSTOM ACTION BARU DI SINI
-    # ==============================================================================
+    @action(detail=True, methods=['get'])
+    def history(self, request, pk=None):
+        """
+        Mengambil riwayat pergerakan stok dengan saldo awal dan akhir.
+        """
+        stock_item = self.get_object()
+        
+        start_date_str = request.query_params.get('start_date', None)
+        end_date_str = request.query_params.get('end_date', None)
+
+        # --- 1. HITUNG SALDO AWAL (OPENING BALANCE) ---
+        opening_balance = Decimal('0.0') # Default saldo awal adalah 0
+        
+        # Hanya hitung saldo awal jika start_date diberikan
+        if start_date_str:
+            try:
+                # Pastikan format tanggal valid
+                start_date_dt = datetime.strptime(start_date_str, '%Y-%m-%d')
+                
+                # Ambil semua pergerakan SEBELUM start_date
+                opening_balance_query = StockMovement.objects.filter(
+                    product=stock_item.product,
+                    location=stock_item.location,
+                    movement_date__lt=start_date_dt
+                )
+                
+                opening_balance_agg = opening_balance_query.aggregate(total_quantity=Sum('quantity'))
+                opening_balance = opening_balance_agg['total_quantity'] or Decimal('0.0')
+
+            except (ValueError, TypeError):
+                # Jika format tanggal salah, biarkan opening_balance tetap 0
+                pass
+
+        # --- 2. AMBIL PERGERAKAN DALAM RENTANG TANGGAL ---
+        movements_query = StockMovement.objects.filter(
+            product=stock_item.product,
+            location=stock_item.location
+        )
+
+        if start_date_str:
+            # Gunakan GTE (>=) untuk mencakup transaksi pada start_date
+            movements_query = movements_query.filter(movement_date__gte=start_date_str)
+            
+        if end_date_str:
+            try:
+                # Tambah 1 hari untuk membuat end_date inklusif
+                end_date_dt = datetime.strptime(end_date_str, '%Y-%m-%d') + timedelta(days=1)
+                movements_query = movements_query.filter(movement_date__lt=end_date_dt)
+            except (ValueError, TypeError):
+                pass
+
+        # --- 3. HITUNG SALDO AKHIR (CLOSING BALANCE) ---
+        # Ambil semua pergerakan dalam periode yang difilter
+        movements_in_period = movements_query.order_by('movement_date', 'created_at')
+        
+        # Jumlahkan kuantitas dari pergerakan dalam periode ini
+        movements_in_period_total = movements_in_period.aggregate(
+            total_quantity=Sum('quantity')
+        )['total_quantity'] or Decimal('0.0')
+        
+        # Saldo akhir adalah saldo awal + total pergerakan dalam periode
+        closing_balance = opening_balance + movements_in_period_total
+
+        # --- 4. SERIALISASI DAN KEMBALIKAN DATA ---
+        serializer = StockMovementSerializer(movements_in_period, many=True)
+        
+        response_data = {
+            'opening_balance': opening_balance,
+            'closing_balance': closing_balance,
+            'movements': serializer.data,
+        }
+        
+        return Response(response_data)
+
     @action(detail=False, methods=['post'], url_path='receive')
     def receive_stock(self, request):
         """
@@ -384,6 +458,240 @@ class AssemblyOrderViewSet(viewsets.ModelViewSet):
             
         return queryset.order_by('-order_date')
 
+    @action(detail=True, methods=['get'], url_path='check-availability')
+    def check_availability(self, request, pk=None):
+        """
+        Checks the material availability for a given assembly order without changing its status.
+        """
+        order = self.get_object()
+
+        # Validasi 1: Pastikan order memiliki BOM
+        if not order.bom:
+            return Response(
+                {'error': 'Assembly Order does not have a Bill of Materials assigned.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validasi 2: Pastikan lokasi produksi sudah ditentukan
+        if not order.production_location:
+            return Response(
+                {'error': 'Production location is not set for this order.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        availability_data = []
+        is_fully_available = True
+        
+        # Ambil semua item dari BOM yang terkait
+        bom_items = order.bom.bom_items.all()
+
+        for bom_item in bom_items:
+            component = bom_item.component
+            required_quantity = bom_item.quantity * order.quantity
+
+            # Cek stok komponen di lokasi produksi
+            try:
+                stock = Stock.objects.get(
+                    product=component,
+                    location=order.production_location
+                )
+                available_quantity = stock.quantity_sellable
+            except Stock.DoesNotExist:
+                available_quantity = 0
+
+            # Tentukan status ketersediaan
+            shortage = required_quantity - available_quantity
+            if shortage <= 0:
+                status_text = 'Available'
+                shortage = 0
+            else:
+                status_text = 'Shortage'
+                is_fully_available = False
+
+            availability_data.append({
+                'component_id': component.id,
+                'component_name': component.name,
+                'component_sku': component.sku,
+                'component_color': component.color,
+                'required_quantity': required_quantity,
+                'available_quantity': available_quantity,
+                'shortage': shortage,
+                'status': status_text,
+            })
+
+        # Siapkan respons
+        response_data = {
+            'order_id': order.id,
+            'order_number': order.order_number,
+            'is_fully_available': is_fully_available,
+            'components': availability_data,
+        }
+
+        return Response(response_data)
+    
+    @action(detail=True, methods=['post'], url_path='release')
+    def release_order(self, request, pk=None):
+        """
+        Releases a DRAFT assembly order to be ready for production.
+        """
+        order = self.get_object()
+        if order.status != 'DRAFT':
+            return Response(
+                {'error': 'Only DRAFT orders can be released.'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Di sini Anda bisa menambahkan logika lebih lanjut, seperti mengecek ketersediaan komponen.
+        # Untuk saat ini, kita hanya ubah statusnya.
+        
+        order.status = 'RELEASED'
+        order.save()
+        
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='start-production')
+    def start_production(self, request, pk=None):
+        """
+        Starts production for a RELEASED assembly order.
+        """
+        order = self.get_object()
+        if order.status != 'RELEASED':
+            return Response(
+                {'error': 'Only RELEASED orders can be started.'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        order.status = 'IN_PROGRESS'
+        order.actual_start_date = timezone.now() # Pastikan timezone diimpor
+        order.save()
+        
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='report-production')
+    def report_production(self, request, pk=None):
+        
+        order = self.get_object()
+
+        # Validasi 1: Hanya order 'IN_PROGRESS' yang bisa dilaporkan hasilnya
+        if order.status != 'IN_PROGRESS':
+            return Response(
+                {'error': 'Production can only be reported for IN_PROGRESS orders.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validasi 2: Ambil kuantitas dari request body
+        try:
+            quantity_produced_input = Decimal(request.data.get('quantity_produced', '0'))
+            if quantity_produced_input <= 0:
+                raise ValueError("Quantity produced must be a positive number.")
+        except (ValueError, InvalidOperation): # Tangkap juga InvalidOperation dari Decimal
+            return Response(
+                {'error': 'Invalid or missing "quantity_produced" in request.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validasi tambahan: Pastikan order memiliki BOM
+        if not order.bom:
+            return Response({'error': 'Cannot report production without a BOM.'}, status=status.HTTP_400_BAD_REQUEST)
+       
+        bom_items = order.bom.bom_items.all()
+        production_location = order.production_location
+        
+        # Buat daftar untuk menyimpan kebutuhan dan stok yang akan di-update
+        component_updates = []
+
+        for bom_item in bom_items:
+            component = bom_item.component
+            quantity_consumed = bom_item.quantity * quantity_produced_input
+
+            try:
+                component_stock = Stock.objects.get(product=component, location=production_location)
+                if component_stock.quantity_sellable < quantity_consumed:
+                    # Jika stok tidak cukup, langsung kirim error dan hentikan proses
+                    return Response(
+                        {'error': f"Insufficient stock for {component.sku}. Required: {quantity_consumed}, Available: {component_stock.quantity_sellable}."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                component_updates.append({'stock': component_stock, 'consumed': quantity_consumed})
+            except Stock.DoesNotExist:
+                # Jika komponen tidak ada sama sekali, langsung kirim error
+                return Response(
+                    {'error': f"Component {component.sku} not found at location {production_location.name}."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Gunakan transaction.atomic untuk memastikan semua operasi berhasil atau tidak sama sekali
+        with transaction.atomic():
+
+            order.quantity_produced += quantity_produced_input
+            
+            if order.quantity_produced >= order.quantity:
+                order.status = 'COMPLETED'
+                order.actual_completion_date = timezone.now()
+            order.save()
+
+            for update in component_updates:
+                component_stock = update['stock']
+                quantity_consumed = update['consumed']
+                
+                component_stock.quantity_on_hand -= quantity_consumed
+                component_stock.quantity_sellable -= quantity_consumed
+                component_stock.save()
+
+                StockMovement.objects.create(
+                    product=component_stock.product, location=production_location, movement_type='ASSEMBLY',
+                    quantity=-quantity_consumed, unit_cost=component_stock.average_cost,
+                    reference_number=order.order_number, reference_type='ASSEMBLY_ORDER',
+                    notes=f'Component for Assembly Order {order.order_number}', user=request.user
+                )
+
+        serializer = self.get_serializer(order)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='complete')
+    def complete_order(self, request, pk=None):
+        """
+        Marks an IN_PROGRESS assembly order as COMPLETED.
+        """
+        order = self.get_object()
+        if order.status != 'IN_PROGRESS':
+            return Response(
+                {'error': 'Only IN_PROGRESS orders can be completed.'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        # Di sini Anda bisa menambahkan logika untuk mencatat hasil produksi
+        # dan mengonsumsi komponen dari stok.
+        
+        order.status = 'COMPLETED'
+        order.actual_completion_date = timezone.now()
+        order.save()
+        
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='cancel')
+    def cancel_order(self, request, pk=None):
+        """
+        Cancels an assembly order that is not yet completed.
+        """
+        order = self.get_object()
+        if order.status in ['COMPLETED', 'CANCELLED']:
+            return Response(
+                {'error': f'A {order.status} order cannot be cancelled.'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Di sini Anda bisa menambahkan logika untuk mengembalikan komponen yang sudah dialokasikan ke stok.
+        
+        order.status = 'CANCELLED'
+        order.save()
+        
+        serializer = self.get_serializer(order)
+        return Response(serializer.data)
+
 class AssemblyOrderItemViewSet(viewsets.ModelViewSet):
     queryset = AssemblyOrderItem.objects.all()
     serializer_class = AssemblyOrderItemSerializer
@@ -451,9 +759,11 @@ class StockMovementViewSet(viewsets.ModelViewSet):
         serializer.save(updated_by=self.request.user)
 
 class GoodsReceiptViewSet(viewsets.ModelViewSet):
-    queryset = GoodsReceipt.objects.all()
+    queryset = GoodsReceipt.objects.all().select_related(
+        'purchase_order', 'assembly_order', 'supplier', 'location', 'received_by'
+    )
     serializer_class = GoodsReceiptSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     
     def get_serializer_class(self):
         # Gunakan serializer yang sudah dimodifikasi
@@ -531,6 +841,28 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
                 {'error': str(e)}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+    @action(detail=False, methods=['get'])
+    def available_assembly_orders(self, request):
+        """
+        Menyediakan daftar Assembly Orders yang memiliki barang jadi yang siap diterima.
+        """
+        # Kita cari AO yang statusnya IN_PROGRESS atau COMPLETED
+        # dan jumlah yang diproduksi > 0
+        assembly_orders = AssemblyOrder.objects.filter(
+            Q(status__in=['IN_PROGRESS', 'COMPLETED']),
+            Q(quantity_produced__gt=0)
+        ).select_related('product')
+
+        # Kita bisa filter lebih lanjut untuk hanya menampilkan yang masih punya sisa untuk diterima
+        # (Ini akan menggunakan SerializerMethodField yang kita buat)
+        
+        serializer = AssemblyOrderForReceiptSerializer(assembly_orders, many=True)
+        
+        # Filter hasil serialisasi di Python untuk hanya menyertakan yang quantity_remaining > 0
+        available_orders = [order for order in serializer.data if order['quantity_remaining'] > 0]
+        
+        return Response(available_orders)
     
     @action(detail=True, methods=['post'])
     def confirm_receipt(self, request, pk=None):
@@ -593,6 +925,18 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
                         user=request.user,
                     )
                 
+                if goods_receipt.assembly_order:
+                    ao = goods_receipt.assembly_order
+                    # Hitung total yang sudah diterima untuk AO ini
+                    total_received = ao.goods_receipts.filter(status='CONFIRMED').aggregate(
+                        total=models.Sum('items__quantity_received')
+                    )['total'] or 0
+                    
+                    # Jika total yang diterima >= total yang diproduksi, AO bisa dianggap selesai diterima
+                    if total_received >= ao.quantity_produced:
+                        # Di sini Anda bisa menambahkan logika tambahan, misal mengubah status custom di AO
+                        pass
+
                 # Check if purchase order is fully received
                 if goods_receipt.purchase_order:
                     po = goods_receipt.purchase_order
