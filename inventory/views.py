@@ -395,7 +395,22 @@ class BillOfMaterialsViewSet(viewsets.ModelViewSet):
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        queryset = BillOfMaterials.objects.select_related('product').prefetch_related('bom_items__component').all()
+        queryset = BillOfMaterials.objects.select_related(
+            'product', 
+            'product__main_category', 
+            'product__sub_category'
+        ).prefetch_related(
+            # Saat prefetch bom_items, kita juga select_related component-nya
+            models.Prefetch(
+                'bom_items',
+                queryset=BOMItem.objects.select_related(
+                    'component', 
+                    'component__main_category', 
+                    'component__sub_category'
+                )
+            )
+        ).all()
+
         product = self.request.query_params.get('product', None)
         
         if product:

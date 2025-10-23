@@ -131,6 +131,14 @@ class Product(BaseModel):
     
     cost_price = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
     selling_price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    discount = models.DecimalField(
+        max_digits=5, 
+        decimal_places=2, 
+        default=0.00, 
+        help_text="Product-specific discount percentage. Overrides group discount if higher."
+    )
+    
     unit_of_measure = models.CharField(max_length=50, default="pcs")
     weight = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
     dimensions = models.CharField(max_length=100, blank=True, null=True, help_text="L x W x H")
@@ -172,7 +180,7 @@ class Product(BaseModel):
             parts.append(f"{self.color}")
         if self.size:
             parts.append(f"Size: {self.size}")
-        return " | ".join(parts)
+        return " ".join(parts)
     
     @property
     def category_path(self):

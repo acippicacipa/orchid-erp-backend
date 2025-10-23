@@ -52,7 +52,7 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'sku', 'description', 'main_category', 'sub_category',
             'main_category_name', 'sub_category_name', 'category_path', 'full_name',
-            'color', 'size', 'brand', 'model', 'cost_price', 'selling_price',
+            'color', 'size', 'brand', 'model', 'cost_price', 'selling_price', 'discount',
             'unit_of_measure', 'weight', 'dimensions', 'is_active', 'is_sellable',
             'is_purchasable', 'is_manufactured', 'minimum_stock_level',
             'maximum_stock_level', 'reorder_point', 'barcode', 'supplier_code',
@@ -99,16 +99,29 @@ class BillOfMaterialsSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['bom_number', 'product_name', 'product_sku', 'product_color']
 
-    # Override 'to_representation' untuk menampilkan detail saat membaca
     def to_representation(self, instance):
         representation = super().to_representation(instance)
-        # Di sini kita bisa memperkaya data 'bom_items' untuk tampilan
+        
+        # Di dalam serializer internal ini kita tambahkan 'component_color'
         class BOMItemDetailSerializer(serializers.ModelSerializer):
             component_name = serializers.CharField(source='component.name', read_only=True)
             component_sku = serializers.CharField(source='component.sku', read_only=True)
+            
+            # --- TAMBAHKAN FIELD BARU DI SINI ---
+            component_color = serializers.CharField(source='component.color', read_only=True, allow_blank=True)
+            
             class Meta:
                 model = BOMItem
-                fields = ['id', 'component', 'component_name', 'component_sku', 'quantity', 'notes']
+                # --- TAMBAHKAN 'component_color' KE DAFTAR FIELDS ---
+                fields = [
+                    'id', 
+                    'component', 
+                    'component_name', 
+                    'component_sku', 
+                    'component_color', # <-- Tambahkan di sini
+                    'quantity', 
+                    'notes'
+                ]
         
         representation['bom_items'] = BOMItemDetailSerializer(instance.bom_items.all(), many=True).data
         return representation
