@@ -28,7 +28,7 @@ class CustomerSerializer(serializers.ModelSerializer):
             'address_line_1', 'address_line_2', 'city', 'state', 'postal_code', 'country',
             'contact_person', 'company_name', 'tax_id', 
             'customer_group', 'customer_group_name', 'group_discount_percentage',
-            'credit_limit', 'payment_terms',
+            'payment_type','credit_limit', 'payment_terms',
             'is_active', 'notes', 'full_address',
             'created_at', 'updated_at', 'created_by', 'updated_by'
         ]
@@ -44,7 +44,9 @@ class ProductSearchSerializer(serializers.ModelSerializer):
         # Sesuaikan fields dengan yang dibutuhkan frontend
         fields = [
             'id', 
-            'name', 
+            'name',
+            'color',
+            'full_name',  
             'sku', 
             'selling_price', # Frontend butuh ini
             'category_path', # Ganti dari category_name
@@ -287,6 +289,7 @@ class CustomerListSerializer(serializers.ModelSerializer):
             'phone', 
             'city', 
             'is_active',
+            'payment_type',
             'customer_group', # ID dari grup
             'customer_group_name' # Nama dari grup
         ]

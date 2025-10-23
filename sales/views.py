@@ -171,7 +171,34 @@ class SalesOrderViewSet(viewsets.ModelViewSet):
         return SalesOrderSerializer
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        sales_order = serializer.save(created_by=self.request.user)
+
+        # --- LOGIKA OTOMATIS UNTUK PENJUALAN TUNAI ---
+        if sales_order.customer.payment_type == 'CASH' and sales_order.amount_paid >= sales_order.total_amount:
+            # 1. Buat Invoice secara otomatis
+            invoice = Invoice.objects.create(
+                sales_order=sales_order,
+                customer=sales_order.customer,
+                invoice_date=sales_order.order_date,
+                due_date=sales_order.order_date, # Jatuh tempo hari ini
+                total_amount=sales_order.total_amount,
+                amount_paid=sales_order.amount_paid,
+                status='PAID', # Langsung lunas
+                created_by=self.request.user
+            )
+
+            # 2. Buat record Payment secara otomatis
+            Payment.objects.create(
+                invoice=invoice,
+                payment_date=sales_order.order_date,
+                amount=sales_order.amount_paid,
+                payment_method=sales_order.payment_method,
+                created_by=self.request.user
+            )
+            
+            # 3. (Opsional) Update status SO menjadi 'DELIVERED' atau 'COMPLETED'
+            sales_order.status = 'DELIVERED'
+            sales_order.save()
 
     def perform_update(self, serializer):
         serializer.save(updated_by=self.request.user)
