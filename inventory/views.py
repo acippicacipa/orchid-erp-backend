@@ -1,9 +1,10 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import AllowAny
 from django.db.models import Q, F, Sum
+from django_filters.rest_framework import DjangoFilterBackend
 from accounts.permissions import IsAdminOrWarehouse
 from django.db import transaction, models
 from django.shortcuts import get_object_or_404
@@ -394,27 +395,17 @@ class BillOfMaterialsViewSet(viewsets.ModelViewSet):
     serializer_class = BillOfMaterialsSerializer
     permission_classes = [AllowAny]
 
-    def get_queryset(self):
-        queryset = BillOfMaterials.objects.select_related(
-            'product', 
-            'product__main_category', 
-            'product__sub_category'
-        ).prefetch_related(
-            # Saat prefetch bom_items, kita juga select_related component-nya
-            models.Prefetch(
-                'bom_items',
-                queryset=BOMItem.objects.select_related(
-                    'component', 
-                    'component__main_category', 
-                    'component__sub_category'
-                )
-            )
-        ).all()
+    filter_backends = [filters.SearchFilter, DjangoFilterBackend]
+    search_fields = ['product__name', 'product__sku', 'bom_number']
+    filterset_fields = ['product', 'is_default']
 
-        product = self.request.query_params.get('product', None)
+    def get_queryset(self):
+        queryset = BillOfMaterials.objects.select_related('product').prefetch_related('bom_items__component').all()
         
-        if product:
-            queryset = queryset.filter(product_id=product)
+        # Logika filter 'product' yang lama bisa dihapus karena sudah ditangani oleh filterset_fields
+        # product = self.request.query_params.get('product', None)
+        # if product:
+        #     queryset = queryset.filter(product_id=product)
             
         return queryset.order_by('product__name', 'version')
     
@@ -545,6 +536,7 @@ class AssemblyOrderViewSet(viewsets.ModelViewSet):
         return Response(response_data)
     
     @action(detail=True, methods=['post'], url_path='release')
+    @transaction.atomic
     def release_order(self, request, pk=None):
         """
         Releases a DRAFT assembly order to be ready for production.
@@ -555,9 +547,46 @@ class AssemblyOrderViewSet(viewsets.ModelViewSet):
                 {'error': 'Only DRAFT orders can be released.'}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        if not order.production_location:
+            return Response(
+                {'error': 'Production location must be set before releasing the order.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
-        # Di sini Anda bisa menambahkan logika lebih lanjut, seperti mengecek ketersediaan komponen.
-        # Untuk saat ini, kita hanya ubah statusnya.
+        required_items = order.items.all()
+        if not required_items.exists() and order.bom:
+            # Jika item belum ada, buat dari BOM (sebagai fallback)
+            required_items = order.bom.bom_items.all()
+
+        for item in required_items:
+            component = item.component
+            # Jika dari BOM, quantity perlu dikalikan. Jika dari AssemblyOrderItem, sudah final.
+            required_quantity = item.quantity if hasattr(item, 'assembly_order') else item.quantity * order.quantity
+
+            try:
+                # Ambil record stok untuk komponen ini di lokasi produksi
+                stock = Stock.objects.select_for_update().get(
+                    product=component,
+                    location=order.production_location
+                )
+
+                # Cek apakah stok yang bisa dijual mencukupi
+                if stock.quantity_sellable < required_quantity:
+                    # Jika tidak cukup, batalkan seluruh transaksi
+                    raise Exception(f"Insufficient stock for {component.name}. Required: {required_quantity}, Available: {stock.quantity_sellable}")
+
+                # 2. Pindahkan kuantitas dari sellable ke allocated
+                stock.quantity_sellable -= required_quantity
+                stock.quantity_allocated += required_quantity
+                stock.save()
+
+            except Stock.DoesNotExist:
+                # Jika record stok tidak ada sama sekali, berarti stok 0
+                raise Exception(f"Stock record for component {component.name} not found at location {order.production_location.name}.")
+            except Exception as e:
+                # Tangkap error dari pengecekan stok dan kirim sebagai respons
+                return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         
         order.status = 'RELEASED'
         order.save()
@@ -666,6 +695,7 @@ class AssemblyOrderViewSet(viewsets.ModelViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='complete')
+    @transaction.atomic
     def complete_order(self, request, pk=None):
         """
         Marks an IN_PROGRESS assembly order as COMPLETED.
@@ -677,8 +707,44 @@ class AssemblyOrderViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
             
-        # Di sini Anda bisa menambahkan logika untuk mencatat hasil produksi
-        # dan mengonsumsi komponen dari stok.
+        unproduced_quantity = order.quantity - order.quantity_produced
+
+        # 2. Hanya jalankan logika jika ada selisih (jika produksi kurang dari rencana)
+        if unproduced_quantity > 0:
+            required_items = order.items.all()
+            if not required_items.exists() and order.bom:
+                required_items = order.bom.bom_items.all()
+
+            for item in required_items:
+                component = item.component
+                
+                # Hitung berapa banyak komponen yang tidak terpakai
+                # Jika dari BOM, quantity per produk jadi. Jika dari AssemblyOrderItem, sudah total.
+                # Kita asumsikan item sudah di AssemblyOrderItem, jadi quantity sudah total.
+                # Untuk mendapatkan per unit, kita bagi dengan total quantity.
+                qty_per_product = item.quantity / order.quantity
+                unused_component_qty = qty_per_product * unproduced_quantity
+
+                if unused_component_qty > 0:
+                    try:
+                        stock = Stock.objects.select_for_update().get(
+                            product=component,
+                            location=order.production_location
+                        )
+                        
+                        # Pastikan kita tidak mengembalikan lebih dari yang dialokasikan
+                        # Ini sebagai pengaman jika ada anomali data
+                        deallocate_qty = min(unused_component_qty, stock.quantity_allocated)
+
+                        # 3. Kembalikan stok dari allocated ke sellable
+                        stock.quantity_allocated -= deallocate_qty
+                        stock.quantity_sellable += deallocate_qty
+                        stock.save()
+
+                    except Stock.DoesNotExist:
+                        # Seharusnya tidak terjadi jika alokasi berjalan benar
+                        print(f"WARNING: Stock record for {component.name} not found during completion of AO {order.order_number}.")
+                        pass
         
         order.status = 'COMPLETED'
         order.actual_completion_date = timezone.now()
@@ -688,18 +754,41 @@ class AssemblyOrderViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     @action(detail=True, methods=['post'], url_path='cancel')
+    @transaction.atomic
     def cancel_order(self, request, pk=None):
         """
         Cancels an assembly order that is not yet completed.
         """
         order = self.get_object()
-        if order.status in ['COMPLETED', 'CANCELLED']:
+        original_status = order.status
+        if original_status in ['COMPLETED', 'CANCELLED']:
             return Response(
                 {'error': f'A {order.status} order cannot be cancelled.'}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Di sini Anda bisa menambahkan logika untuk mengembalikan komponen yang sudah dialokasikan ke stok.
+        if original_status in ['RELEASED', 'IN_PROGRESS']:
+            required_items = order.items.all()
+            for item in required_items:
+                component = item.component
+                required_quantity = item.quantity
+
+                try:
+                    stock = Stock.objects.select_for_update().get(
+                        product=component,
+                        location=order.production_location
+                    )
+                    
+                    # Kembalikan kuantitas dari allocated ke sellable
+                    stock.quantity_allocated -= required_quantity
+                    stock.quantity_sellable += required_quantity
+                    stock.save()
+
+                except Stock.DoesNotExist:
+                    # Ini seharusnya tidak terjadi, tapi sebagai pengaman, log error
+                    # Anda bisa menggunakan logging library Python di sini
+                    print(f"WARNING: Stock record for {component.name} not found during cancellation of AO {order.order_number}.")
+                    pass # Lanjutkan proses meskipun ada anomali
         
         order.status = 'CANCELLED'
         order.save()

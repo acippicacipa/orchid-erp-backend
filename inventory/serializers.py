@@ -158,7 +158,7 @@ class AssemblyOrderSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.name', read_only=True, allow_null=True)
     product_color = serializers.CharField(source='product.color', read_only=True, allow_null=True)
     items = AssemblyOrderItemSerializer(many=True, read_only=True)
-    production_location_name = serializers.CharField(source='production_location.name', read_only=True, allow_null=True)
+    production_location_name = serializers.CharField(source='production_location.code', read_only=True, allow_null=True)
 
     class Meta:
         model = AssemblyOrder
