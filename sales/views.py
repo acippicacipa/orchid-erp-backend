@@ -2,22 +2,53 @@ from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Q, Sum, Count
+from django.db.models import Sum, F, ExpressionWrapper, DecimalField, Q
+from django.db import transaction
 from django.utils import timezone
 from datetime import datetime, timedelta
 from accounts.permissions import IsAdminOrSales
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import IsAdminUser
+from inventory.models import Stock, Location, StockMovement
+from .filters import SalesOrderFilter
 from .services import PricingService
-from .models import Customer, CustomerGroup, Product, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage
+from .models import Customer, CustomerGroup, Product, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage, DeliveryOrder
 from .serializers import (
     CustomerSerializer, CustomerListSerializer, CustomerGroupSerializer,
     SalesOrderSerializer, SalesOrderListSerializer, SalesOrderItemSerializer,
     InvoiceSerializer, InvoiceListSerializer, PaymentSerializer,
     ProductSearchSerializer, DownPaymentSerializer, DownPaymentUsageSerializer,
-    CustomerDownPaymentSummarySerializer
+    CustomerDownPaymentSummarySerializer, DeliveryOrderSerializer, CreateConsolidatedInvoiceSerializer, InvoicePrintItemSerializer
 )
 from inventory.models import Product
 from decimal import Decimal, InvalidOperation
+from collections import defaultdict
+
+def calculate_due_date(base_date, payment_terms_str):
+    """
+    Menghitung tanggal jatuh tempo berdasarkan string payment terms.
+    Contoh: 'Net 30 days' -> base_date + 30 hari.
+    """
+    try:
+        # Coba ekstrak angka dari string, misal "Net 30 days" -> "30"
+        days_str = ''.join(filter(str.isdigit, payment_terms_str))
+        if days_str:
+            days = int(days_str)
+            return base_date + timedelta(days=days)
+    except (ValueError, TypeError):
+        # Jika gagal (misal, payment_terms adalah 'Cash on Delivery'),
+        # kembalikan tanggal dasar.
+        pass
+    
+    # Default jika tidak ada angka atau format tidak dikenali
+    return base_date
+
+class DeliveryOrderViewSet(viewsets.ModelViewSet):
+    queryset = DeliveryOrder.objects.select_related('sales_order__customer').all()
+    serializer_class = DeliveryOrderSerializer
+    permission_classes = [IsAdminOrSales] # Sesuaikan permission
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['status', 'carrier']
+    search_fields = ['do_number', 'sales_order__order_number', 'tracking_number']
 
 class CustomerGroupViewSet(viewsets.ModelViewSet):
     """
@@ -47,6 +78,28 @@ class CustomerViewSet(viewsets.ModelViewSet):
         if self.action == 'list':
             return CustomerListSerializer
         return CustomerSerializer
+    
+    def get_queryset(self):
+        """
+        Optimalkan queryset dengan anotasi untuk menghindari N+1 query.
+        """
+        queryset = Customer.objects.select_related('customer_group').annotate(
+            # Hitung total balance_due dari invoice yang relevan
+            total_outstanding=Sum(
+                'invoices__balance_due',
+                filter=Q(invoices__status__in=['SENT', 'PARTIAL', 'OVERDUE', 'DRAFT'])
+            )
+        ).annotate(
+            # Buat field 'outstanding_balance' dari hasil anotasi
+            outstanding_balance_calc=ExpressionWrapper(
+                F('total_outstanding'), output_field=DecimalField()
+            ),
+            # Hitung 'available_credit' langsung di database
+            available_credit_calc=ExpressionWrapper(
+                F('credit_limit') - F('total_outstanding'), output_field=DecimalField()
+            )
+        )
+        return queryset
 
     @action(detail=False, methods=['get'])
     def search(self, request):
@@ -157,22 +210,33 @@ class SalesOrderViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing sales orders with advanced features
     """
-    queryset = SalesOrder.objects.all().select_related('customer').prefetch_related('items__product')
+    queryset = SalesOrder.objects.select_related(
+        'customer', 
+        'customer__customer_group' # Jika Anda butuh info grup di customer_details
+    ).prefetch_related(
+        'items', 
+        'items__product' # Ambil semua item dan produk terkait dalam 2 query
+    ).all()
     permission_classes = [IsAdminOrSales]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['status', 'customer', 'order_date']
-    search_fields = ['order_number', 'customer__name', 'notes']
+    filterset_class = SalesOrderFilter
+    search_fields = ['order_number', 'customer__name']
     ordering_fields = ['order_date', 'order_number', 'total_amount', 'created_at']
     ordering = ['-order_date', '-created_at']
 
     def get_serializer_class(self):
-        if self.action == 'list':
+        if self.action == 'list' or self.action == 'retrieve':
             return SalesOrderListSerializer
         return SalesOrderSerializer
 
     def perform_create(self, serializer):
         sales_order = serializer.save(created_by=self.request.user)
 
+        if sales_order.down_payment_amount > 0:
+            # Jika ada DP, ubah status menjadi Partially Paid
+            sales_order.status = 'PARTIALLY_PAID'
+            sales_order.save()
+            
         # --- LOGIKA OTOMATIS UNTUK PENJUALAN TUNAI ---
         if sales_order.customer.payment_type == 'CASH' and sales_order.amount_paid >= sales_order.total_amount:
             # 1. Buat Invoice secara otomatis
@@ -203,37 +267,64 @@ class SalesOrderViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         serializer.save(updated_by=self.request.user)
 
-    @action(detail=True, methods=['post'])
-    def confirm(self, request, pk=None):
-        """Confirm a sales order"""
+    @action(detail=True, methods=['post'], url_path='confirm')
+    def confirm_order(self, request, pk=None):
         sales_order = self.get_object()
-        
+        customer = sales_order.customer
+
         if sales_order.status != 'DRAFT':
-            return Response(
-                {'error': 'Only draft orders can be confirmed'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Check inventory availability
-        insufficient_stock = []
-        for item in sales_order.items.all():
-            if item.product.stock_quantity < item.quantity:
-                insufficient_stock.append({
-                    'product': item.product.name,
-                    'required': float(item.quantity),
-                    'available': float(item.product.stock_quantity)
-                })
-        
-        if insufficient_stock:
-            return Response(
-                {'error': 'Insufficient stock', 'details': insufficient_stock},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
+            return Response({'error': 'Only DRAFT orders can be confirmed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --- LOGIKA PENGECEKAN KREDIT ---
+        # Cek jika customer memiliki limit kredit (jika limit 0, dianggap tidak terbatas)
+        if customer.credit_limit > 0:
+            # Hitung total utang jika SO ini dikonfirmasi
+            projected_balance = customer.outstanding_balance + sales_order.total_amount
+            
+            if projected_balance > customer.credit_limit:
+                # Jika over limit, ubah status dan beri pesan
+                sales_order.status = 'PENDING_APPROVAL'
+                sales_order.save()
+                
+                # Di sini Anda bisa menambahkan logika untuk mengirim notifikasi ke pimpinan
+                # send_approval_notification(sales_order)
+                
+                return Response({
+                    'message': 'Order exceeds credit limit and has been sent for approval.',
+                    'status': 'PENDING_APPROVAL'
+                }, status=status.HTTP_202_ACCEPTED) # Gunakan status 202 Accepted
+
+        # Jika tidak over limit, langsung konfirmasi
         sales_order.status = 'CONFIRMED'
         sales_order.save()
         
-        return Response({'message': 'Sales order confirmed successfully'})
+        return Response({
+            'message': 'Sales order has been confirmed successfully.',
+            'status': 'CONFIRMED'
+        })
+
+    @action(detail=True, methods=['post'], url_path='approve', permission_classes=[IsAdminUser])
+    def approve_order(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status != 'PENDING_APPROVAL':
+            return Response({'error': 'Only orders pending approval can be approved.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sales_order.status = 'CONFIRMED'
+        sales_order.approved_by = request.user
+        sales_order.approved_at = timezone.now()
+        sales_order.save()
+        return Response({'message': 'Sales order approved and confirmed.'})
+
+    @action(detail=True, methods=['post'], url_path='reject', permission_classes=[IsAdminUser])
+    def reject_order(self, request, pk=None):
+        sales_order = self.get_object()
+        if sales_order.status != 'PENDING_APPROVAL':
+            return Response({'error': 'Only orders pending approval can be rejected.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sales_order.status = 'REJECTED'
+        sales_order.rejection_reason = request.data.get('reason', 'No reason provided.')
+        sales_order.save()
+        return Response({'message': 'Sales order has been rejected.'})
 
     @action(detail=True, methods=['post'])
     def ship(self, request, pk=None):
@@ -301,6 +392,149 @@ class SalesOrderViewSet(viewsets.ModelViewSet):
         sales_order.save()
         
         return Response({'message': 'Sales order cancelled successfully'})
+
+    @action(detail=True, methods=['post'], url_path='start_processing')
+    @transaction.atomic # Gunakan transaksi atomik untuk memastikan integritas data
+    def start_processing(self, request, pk=None):
+        sales_order = self.get_object()
+
+        if sales_order.status != 'CONFIRMED':
+            return Response({'error': 'Only CONFIRMED orders can be processed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Logika Alokasi Stok
+        for item in sales_order.items.all():
+            try:
+                # Asumsi Anda memiliki satu lokasi gudang utama atau logika untuk menentukannya
+                # Ganti dengan logika penentuan lokasi yang sesuai
+                stock_location = Location.objects.filter(location_type='WAREHOUSE').first()
+                if not stock_location:
+                    raise Exception("Main warehouse location not found.")
+
+                stock = Stock.objects.get(product=item.product, location=stock_location)
+                
+                # Cek apakah stok yang bisa dijual mencukupi
+                if stock.quantity_sellable < item.quantity:
+                    return Response({
+                        'error': f'Insufficient sellable stock for {item.product.name}. Required: {item.quantity}, Available: {stock.quantity_sellable}'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                
+                # Alokasikan stok
+                stock.quantity_allocated += item.quantity
+                stock.save()
+
+            except Stock.DoesNotExist:
+                return Response({'error': f'Stock record not found for {item.product.name}.'}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                 return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Jika semua alokasi berhasil, ubah status SO
+        sales_order.status = 'PROCESSING'
+        sales_order.save()
+
+        return Response({'message': 'Order is now being processed and stock has been allocated.'})
+
+    @action(detail=True, methods=['post'], url_path='record_picking')
+    @transaction.atomic
+    def record_picking(self, request, pk=None):
+        sales_order = self.get_object()
+        items_data = request.data.get('items', []) # Frontend mengirim array item dengan picked qty
+
+        if sales_order.status != 'PROCESSING':
+            return Response({'error': 'Can only record picking for PROCESSING orders.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        for item_data in items_data:
+            try:
+                order_item = SalesOrderItem.objects.get(id=item_data['id'], sales_order=sales_order)
+                
+                picked_qty = Decimal(item_data['actual_picked_quantity'])
+
+                if picked_qty > order_item.quantity:
+                    raise serializers.ValidationError(f"Picked quantity for {order_item.product.name} cannot exceed required quantity.")
+                
+                # Update picked_quantity
+                order_item.picked_quantity = picked_qty
+                order_item.save()
+
+            except SalesOrderItem.DoesNotExist:
+                # Abaikan jika item tidak ditemukan, atau log error
+                pass
+            except (KeyError, ValueError, TypeError):
+                return Response({'error': 'Invalid item data provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        total_picked_value = sales_order.items.annotate(
+            line_picked_total=ExpressionWrapper(
+                F('picked_quantity') * F('unit_price') * (Decimal('1.0') - F('discount_percentage') / Decimal('100.0')),
+                output_field=DecimalField()
+            )
+        ).aggregate(
+            total=Sum('line_picked_total')
+        )['total'] or Decimal('0.00')
+
+        # Update field di SalesOrder
+        sales_order.picked_subtotal = total_picked_value
+        sales_order.save()
+
+        # Ambil ulang data SO setelah diupdate untuk dikirim kembali
+        sales_order.refresh_from_db()
+        serializer = self.get_serializer(sales_order)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='create_delivery_order')
+    @transaction.atomic
+    def create_delivery_order(self, request, pk=None):
+        sales_order = self.get_object()
+        
+        if sales_order.status != 'PROCESSING':
+            return Response({'error': 'Only PROCESSING orders can be shipped.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if sales_order.fulfillment_status == 'UNFULFILLED':
+            return Response({
+                'error': 'Cannot create Delivery Order because no items have been picked yet. Please record picked quantities first.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 1. Buat Delivery Order
+        do_data = request.data
+        delivery_order = DeliveryOrder.objects.create(
+            sales_order=sales_order,
+            carrier=do_data.get('carrier'),
+            tracking_number=do_data.get('tracking_number'),
+            notes=do_data.get('notes'),
+            created_by=request.user
+        )
+
+        # 2. Kurangi Stok Fisik (Post-Goods Issue)
+        for item in sales_order.items.all():
+            try:
+                # Tentukan lokasi gudang (sesuaikan dengan logika Anda)
+                stock_location = Location.objects.filter(location_type='WAREHOUSE').first()
+                stock = Stock.objects.get(product=item.product, location=stock_location)
+                
+                # Kurangi stok fisik dan alokasi
+                stock.quantity_on_hand -= item.quantity
+                stock.quantity_allocated -= item.quantity
+                stock.save()
+
+                # Buat catatan pergerakan stok
+                StockMovement.objects.create(
+                    product=item.product,
+                    location=stock_location,
+                    movement_type='SALE',
+                    quantity=-item.quantity, # Kuantitas negatif karena barang keluar
+                    reference_number=sales_order.order_number,
+                    reference_type='SALES_ORDER',
+                    user=request.user
+                )
+            except Stock.DoesNotExist:
+                # Seharusnya tidak terjadi karena stok sudah dialokasikan,
+                # tapi ini sebagai pengaman.
+                raise serializers.ValidationError(f"Stock for {item.product.name} not found during shipping.")
+
+        # 3. Ubah status Sales Order menjadi SHIPPED
+        sales_order.status = 'SHIPPED'
+        sales_order.save()
+
+        serializer = DeliveryOrderSerializer(delivery_order)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'])
     def create_invoice(self, request, pk=None):
@@ -371,6 +605,19 @@ class SalesOrderItemViewSet(viewsets.ModelViewSet):
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['sales_order', 'product']
     ordering = ['id']
+
+    @action(detail=False, methods=['get'], url_path='shortage_summary')
+    def shortage_summary(self, request):
+        # Ambil semua item yang outstanding > 0
+        shortage_items = SalesOrderItem.objects.filter(
+            quantity__gt=F('picked_quantity')
+        ).values(
+            'product__id', 'product__name', 'product__sku'
+        ).annotate(
+            total_shortage=Sum(F('quantity') - F('picked_quantity'))
+        ).order_by('-total_shortage')
+        
+        return Response(shortage_items)
 
 class InvoiceViewSet(viewsets.ModelViewSet):
     """
@@ -458,6 +705,148 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         }
         
         return Response(stats)
+
+    @action(detail=False, methods=['post'], url_path='create-consolidated')
+    @transaction.atomic
+    def create_consolidated_invoice(self, request):
+        """
+        Membuat satu invoice dari satu atau lebih Sales Order.
+        """
+        serializer = CreateConsolidatedInvoiceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        validated_data = serializer.validated_data
+        customer_id = validated_data['customer_id']
+        so_ids = validated_data['sales_order_ids']
+        
+        customer = Customer.objects.get(id=customer_id)
+        orders_to_invoice = SalesOrder.objects.filter(id__in=so_ids)
+
+        total_picked_subtotal = Decimal('0.00')
+        total_order_discount = Decimal('0.00')
+        total_tax = Decimal('0.00')
+        total_shipping = Decimal('0.00')
+
+        # Kita perlu loop untuk menghitung diskon dan pajak per-order secara akurat
+        for order in orders_to_invoice:
+            # 1. Ambil subtotal yang sudah di-pick dari field SO
+            current_picked_subtotal = order.picked_subtotal or Decimal('0.00')
+            
+            # 2. Hitung diskon level order berdasarkan subtotal yang di-pick
+            current_order_discount = current_picked_subtotal * (order.discount_percentage / Decimal('100.0'))
+            
+            # 3. Hitung jumlah kena pajak (taxable amount)
+            taxable_amount = current_picked_subtotal - current_order_discount
+            
+            # 4. Hitung pajak berdasarkan jumlah kena pajak
+            current_order_tax = taxable_amount * (order.tax_percentage / Decimal('100.0'))
+
+            # 5. Akumulasikan semua nilai
+            total_picked_subtotal += current_picked_subtotal
+            total_order_discount += current_order_discount
+            total_tax += current_order_tax
+            total_shipping += order.shipping_cost
+
+        # 6. Hitung Grand Total untuk Invoice
+        grand_total = total_picked_subtotal - total_order_discount + total_tax + total_shipping
+
+        invoice_date = timezone.now().date()
+        
+        # 1. Ambil payment_terms dari customer
+        payment_terms = customer.payment_terms
+        
+        # 2. Hitung due_date menggunakan fungsi helper
+        due_date = calculate_due_date(invoice_date, payment_terms)
+
+        # Buat Invoice baru dengan nilai gabungan yang sudah dihitung
+        new_invoice = Invoice.objects.create(
+            customer=customer,
+            invoice_date=invoice_date,
+            due_date=due_date,
+            notes=validated_data.get('notes', ''),
+            
+            # Simpan nilai-nilai gabungan ini di invoice
+            subtotal=total_picked_subtotal,
+            discount_amount=total_order_discount,
+            tax_amount=total_tax,
+            # Anda mungkin perlu field 'shipping_amount' di model Invoice jika ingin menyimpannya terpisah
+            total_amount=grand_total,
+            
+            created_by=request.user
+        )
+
+        # Tautkan invoice baru ke semua SO yang dipilih
+        # Asumsi: Anda sudah mengubah relasi di model Invoice menjadi ManyToManyField
+        new_invoice.sales_orders.set(orders_to_invoice)
+
+        # Kirim kembali data invoice yang baru dibuat
+        response_serializer = InvoiceSerializer(new_invoice)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'], url_path='print-details')
+    def print_details(self, request, pk=None):
+        """
+        Mengembalikan data invoice lengkap dengan item yang sudah digabungkan
+        untuk keperluan cetak.
+        """
+        invoice = self.get_object()
+        
+        # Ambil semua item dari semua sales order yang terkait dengan invoice ini
+        order_items = SalesOrderItem.objects.filter(
+            sales_order__in=invoice.sales_orders.all()
+        ).select_related('product')
+
+        # Gunakan defaultdict untuk menggabungkan item dengan produk yang sama
+        consolidated_items = defaultdict(lambda: {
+            'product_id': None,
+            'product_sku': '',
+            'product_name': '',
+            'total_picked_quantity': Decimal('0.00'),
+            'unit_price': Decimal('0.00'), # Asumsi harga sama
+            'discount_percentage': Decimal('0.00'), # Asumsi diskon sama
+        })
+
+        for item in order_items:
+            # Hanya proses item yang benar-benar di-pick
+            if item.picked_quantity > 0:
+                key = item.product_id
+                
+                # Isi detail produk jika ini pertama kali
+                if not consolidated_items[key]['product_id']:
+                    consolidated_items[key]['product_id'] = item.product.id
+                    consolidated_items[key]['product_sku'] = item.product.sku
+                    consolidated_items[key]['product_name'] = item.product.name
+                    consolidated_items[key]['unit_price'] = item.unit_price
+                    consolidated_items[key]['discount_percentage'] = item.discount_percentage
+
+                # Jumlahkan kuantitas yang di-pick
+                consolidated_items[key]['total_picked_quantity'] += item.picked_quantity
+
+        # Hitung total untuk setiap item yang sudah digabungkan
+        final_items_list = []
+        for item_data in consolidated_items.values():
+            subtotal = item_data['total_picked_quantity'] * item_data['unit_price']
+            discount_amount = subtotal * (item_data['discount_percentage'] / Decimal('100.0'))
+            total = subtotal - discount_amount
+            
+            item_data['line_subtotal'] = subtotal
+            item_data['line_discount_amount'] = discount_amount
+            item_data['line_total'] = total
+            final_items_list.append(item_data)
+
+        # Siapkan data invoice utama
+        invoice_serializer = InvoiceSerializer(invoice)
+        
+        # Siapkan data item yang sudah digabungkan
+        items_serializer = InvoicePrintItemSerializer(final_items_list, many=True)
+
+        # Gabungkan semuanya dalam satu respons
+        response_data = {
+            'invoice': invoice_serializer.data,
+            'items': items_serializer.data
+        }
+        
+        return Response(response_data)
 
 class PaymentViewSet(viewsets.ModelViewSet):
     """

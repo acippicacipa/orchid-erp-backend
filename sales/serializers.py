@@ -1,9 +1,65 @@
 from rest_framework import serializers
 from decimal import Decimal
 from django.db.models import Sum
-from .models import Customer, CustomerGroup, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage
+from .models import Customer, CustomerGroup, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage, DeliveryOrder
 from inventory.models import Product, Stock
+from django.utils import timezone
+from django.db import models
 
+class InvoicePrintItemSerializer(serializers.Serializer):
+    """
+    Serializer read-only untuk menampilkan item gabungan pada invoice cetak.
+    """
+    product_id = serializers.IntegerField()
+    product_sku = serializers.CharField()
+    product_name = serializers.CharField()
+    total_picked_quantity = serializers.DecimalField(max_digits=10, decimal_places=2)
+    unit_price = serializers.DecimalField(max_digits=15, decimal_places=2)
+    # Kita asumsikan diskon per item sama, jadi kita ambil yang pertama
+    discount_percentage = serializers.DecimalField(max_digits=5, decimal_places=2)
+    line_subtotal = serializers.DecimalField(max_digits=15, decimal_places=2) # Qty * Price
+    line_discount_amount = serializers.DecimalField(max_digits=15, decimal_places=2)
+    line_total = serializers.DecimalField(max_digits=15, decimal_places=2) # Subtotal - Discount
+
+class CreateConsolidatedInvoiceSerializer(serializers.Serializer):
+    """
+    Serializer untuk memvalidasi pembuatan invoice gabungan dari beberapa SO.
+    """
+    customer_id = serializers.IntegerField(required=True)
+    sales_order_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        allow_empty=False,
+        min_length=1
+    )
+    notes = serializers.CharField(allow_blank=True, required=False)
+
+    def validate_customer_id(self, value):
+        if not Customer.objects.filter(id=value).exists():
+            raise serializers.ValidationError("Customer not found.")
+        return value
+
+    def validate(self, data):
+        """
+        Validasi bahwa semua SO milik customer yang sama dan siap di-invoice.
+        """
+        customer_id = data['customer_id']
+        so_ids = data['sales_order_ids']
+
+        orders = SalesOrder.objects.filter(id__in=so_ids)
+
+        if orders.count() != len(so_ids):
+            raise serializers.ValidationError("One or more Sales Orders not found.")
+
+        for order in orders:
+            if order.customer_id != customer_id:
+                raise serializers.ValidationError(f"Order {order.order_number} does not belong to the selected customer.")
+            if order.status not in ['SHIPPED', 'DELIVERED']: # Hanya SO yang sudah dikirim
+                raise serializers.ValidationError(f"Order {order.order_number} is not ready to be invoiced (status is {order.status}).")
+            if hasattr(order, 'invoice'): # Cek apakah sudah pernah dibuatkan invoice
+                raise serializers.ValidationError(f"Order {order.order_number} has already been invoiced.")
+
+        return data
+        
 class CustomerGroupSerializer(serializers.ModelSerializer):
     class Meta:
         model = CustomerGroup
@@ -19,6 +75,8 @@ class CustomerSerializer(serializers.ModelSerializer):
         decimal_places=2,
         allow_null=True
     )
+    available_credit = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
+    outstanding_balance = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
 
     class Meta:
         model = Customer
@@ -30,7 +88,7 @@ class CustomerSerializer(serializers.ModelSerializer):
             'customer_group', 'customer_group_name', 'group_discount_percentage',
             'payment_type','credit_limit', 'payment_terms',
             'is_active', 'notes', 'full_address',
-            'created_at', 'updated_at', 'created_by', 'updated_by'
+            'created_at', 'updated_at', 'created_by', 'updated_by','available_credit', 'outstanding_balance'
         ]
         read_only_fields = ('created_at', 'updated_at', 'created_by', 'updated_by')
 
@@ -67,12 +125,17 @@ class SalesOrderItemSerializer(serializers.ModelSerializer):
     product_name = serializers.ReadOnlyField()
     product_sku = serializers.ReadOnlyField()
     product_details = ProductSearchSerializer(source='product', read_only=True)
+    picked_quantity = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    outstanding_quantity = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    is_fully_picked = serializers.BooleanField(read_only=True)
     
     class Meta:
         model = SalesOrderItem
         fields = [
             'id', 'product', 'product_name', 'product_sku', 'product_details',
-            'quantity', 'unit_price', 'discount_percentage', 'discount_amount',
+            'quantity', 'picked_quantity',
+            'outstanding_quantity',
+            'is_fully_picked', 'unit_price', 'discount_percentage', 'discount_amount',
             'line_total', 'notes', 'created_at', 'updated_at'
         ]
         read_only_fields = ('line_total', 'discount_amount', 'created_at', 'updated_at')
@@ -261,16 +324,40 @@ class PaymentSerializer(serializers.ModelSerializer):
 class SalesOrderListSerializer(serializers.ModelSerializer):
     """Simplified serializer for sales order lists"""
     customer_name = serializers.CharField(source='customer.name', read_only=True)
+    customer_details = CustomerSerializer(source='customer', read_only=True)
     item_count = serializers.IntegerField(source='items.count', read_only=True)
+    items = SalesOrderItemSerializer(many=True, read_only=True)
+    fulfillment_status = serializers.CharField(read_only=True)
     total_amount_formatted = serializers.SerializerMethodField()
-    order_date = serializers.DateField(format="%d/%m/%Y")
-    due_date = serializers.DateField(format="%d/%m/%Y")
+    order_date = serializers.DateField()
+    due_date = serializers.DateField()
     
     class Meta:
         model = SalesOrder
         fields = [
-            'id', 'order_number', 'customer_name', 'order_date', 'due_date', 'status',
-            'total_amount', 'total_amount_formatted', 'item_count'
+            'id', 
+            'order_number', 
+            'order_date', 
+            'status', 
+            'total_amount', 
+            'customer', # ID customer
+            'due_date',
+            'discount_percentage',
+            'discount_amount',
+            'tax_percentage',
+            'shipping_cost',
+            'notes',
+            'payment_method',
+            'down_payment_amount',
+            'guest_name',
+            'guest_phone',
+            'customer_name', 
+            'total_amount_formatted', 
+            'item_count', 
+            'customer_details', 
+            'items',
+            'fulfillment_status',
+            'picked_subtotal'
         ]
 
     def get_total_amount_formatted(self, obj):
@@ -278,6 +365,8 @@ class SalesOrderListSerializer(serializers.ModelSerializer):
 
 class CustomerListSerializer(serializers.ModelSerializer):
     customer_group_name = serializers.CharField(source='customer_group.name', read_only=True, allow_null=True)
+    outstanding_balance = serializers.DecimalField(source='outstanding_balance_calc', max_digits=15, decimal_places=2, read_only=True, default=0)
+    available_credit = serializers.DecimalField(source='available_credit_calc', max_digits=15, decimal_places=2, read_only=True, default=0)
     """Simplified serializer for customer lists"""
     class Meta:
         model = Customer
@@ -291,7 +380,11 @@ class CustomerListSerializer(serializers.ModelSerializer):
             'is_active',
             'payment_type',
             'customer_group', # ID dari grup
-            'customer_group_name' # Nama dari grup
+            'customer_group_name', # Nama dari grup
+            'credit_limit',
+            'outstanding_balance',
+            'available_credit',
+            'payment_terms',
         ]
 
 class InvoiceListSerializer(serializers.ModelSerializer):
@@ -403,5 +496,10 @@ class CustomerDownPaymentSummarySerializer(serializers.ModelSerializer):
         )['total'] or 0
         return total
 
-from django.utils import timezone
-from django.db import models
+class DeliveryOrderSerializer(serializers.ModelSerializer):
+    sales_order_number = serializers.CharField(source='sales_order.order_number', read_only=True)
+    customer_name = serializers.CharField(source='sales_order.customer.name', read_only=True)
+
+    class Meta:
+        model = DeliveryOrder
+        fields = '__all__'
