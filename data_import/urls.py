@@ -8,10 +8,11 @@ router = DefaultRouter()
 urlpatterns = [
     path('', include(router.urls)),
     path('upload/', views.DataUploadView.as_view(), name='data-upload'),
-    path('validate/', views.DataValidationView.as_view(), name='data-validation'),
-    path('import/', views.DataImportView.as_view(), name='data-import'),
+    # path('validate/', views.DataValidationView.as_view(), name='data-validation'),
+    # path('import/', views.DataImportView.as_view(), name='data-import'),
     path('templates/', views.TemplateDownloadView.as_view(), name='template-download'),
-    path('history/', views.ImportHistoryView.as_view(), name='import-history'),
+    path('history/', views.ImportHistoryView.as_view(), name='import-history-list'),
+    path('history/<int:import_id>/', views.ImportHistoryView.as_view(), name='import-history-detail'),
     path('logs/', views.ImportLogsView.as_view(), name='import-logs'),
     path('setup-templates/', views.SetupTemplatesView.as_view(), name='setup-templates'),
 ]

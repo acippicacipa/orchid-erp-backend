@@ -1,11 +1,12 @@
 import pandas as pd
 import json
 from datetime import datetime
+from django.utils import timezone
 from django.db import transaction
 from django.core.exceptions import ValidationError
 from django.contrib.auth.models import User
-from .models import ImportTemplate, DataImport, ImportError, ImportLog
-from inventory.models import Product, MainCategory, SubCategory, Location, Stock
+from .models import ImportTemplate, DataImport, ImportErrorLog, ImportLog
+from inventory.models import Product, Stock, Location, MainCategory, SubCategory
 from sales.models import Customer, SalesOrder, SalesOrderItem, Invoice, Payment
 from purchasing.models import Supplier, PurchaseOrder, PurchaseOrderItem, Bill, SupplierPayment
 from accounting.models import Account, JournalEntry, JournalItem, Ledger
@@ -22,223 +23,144 @@ class DataImportService:
         self.data_import = DataImport.objects.get(id=data_import_id)
         self.template = self.data_import.template
         self.errors = []
-        self.logs = []
     
-    def validate_file(self):
-        """
-        Validate the uploaded file structure and data
-        """
+    def process_file(self):
+        """Fungsi utama yang menjalankan validasi dan impor."""
         try:
-            self.data_import.status = 'VALIDATING'
-            self.data_import.save()
-            
-            # Read the file
-            if self.data_import.file.name.endswith('.csv'):
-                df = pd.read_csv(self.data_import.file.path)
-            elif self.data_import.file.name.endswith(('.xlsx', '.xls')):
-                df = pd.read_excel(self.data_import.file.path)
+            is_valid = self._validate_file()
+            if is_valid:
+                self._import_data()
             else:
-                raise ValidationError("Unsupported file format. Please use CSV or Excel files.")
-            
-            self.data_import.total_rows = len(df)
-            
-            # Validate required columns
-            required_columns = self.template.required_columns
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            
-            if missing_columns:
-                self._add_error(0, None, 'MISSING_COLUMN', 
-                              f"Missing required columns: {', '.join(missing_columns)}")
-                self.data_import.status = 'INVALID'
-                self.data_import.save()
-                return False
-            
-            # Validate data based on template type
-            valid_rows = 0
-            for index, row in df.iterrows():
-                if self._validate_row(index + 1, row):
-                    valid_rows += 1
-            
-            self.data_import.valid_rows = valid_rows
-            self.data_import.invalid_rows = self.data_import.total_rows - valid_rows
-            
-            if self.data_import.valid_rows > 0:
-                self.data_import.status = 'VALID'
-            else:
-                self.data_import.status = 'INVALID'
-            
-            self.data_import.save()
-            self._save_errors_and_logs()
-            
-            return self.data_import.status == 'VALID'
-            
+                self.data_import.status = 'FAILED'
+                self.data_import.notes = "File validation failed."
+                self.data_import.completed_at = timezone.now()
+                self.data_import.save(update_fields=['status', 'notes', 'completed_at'])
         except Exception as e:
-            self._add_log('ERROR', f"Validation failed: {str(e)}")
-            self.data_import.status = 'INVALID'
-            self.data_import.save()
-            self._save_errors_and_logs()
-            return False
-    
-    def import_data(self):
-        """
-        Import validated data into the database
-        """
-        if self.data_import.status != 'VALID':
-            raise ValidationError("Cannot import invalid data")
-        
-        try:
-            self.data_import.status = 'IMPORTING'
-            self.data_import.started_at = datetime.now()
-            self.data_import.save()
-            
-            # Read the file again
-            if self.data_import.file.name.endswith('.csv'):
-                df = pd.read_csv(self.data_import.file.path)
-            else:
-                df = pd.read_excel(self.data_import.file.path)
-            
-            imported_count = 0
-            
-            with transaction.atomic():
-                for index, row in df.iterrows():
-                    if self._import_row(index + 1, row):
-                        imported_count += 1
-            
-            self.data_import.imported_rows = imported_count
-            self.data_import.status = 'COMPLETED'
-            self.data_import.completed_at = datetime.now()
-            self.data_import.save()
-            
-            self._add_log('INFO', f"Successfully imported {imported_count} rows")
-            self._save_errors_and_logs()
-            
-            return True
-            
-        except Exception as e:
-            self._add_log('ERROR', f"Import failed: {str(e)}")
+            logger.error(f"Critical error during import {self.data_import.id}: {e}", exc_info=True)
             self.data_import.status = 'FAILED'
+            self.data_import.notes = f"A critical error occurred: {str(e)}"
+            self.data_import.completed_at = timezone.now()
             self.data_import.save()
-            self._save_errors_and_logs()
-            return False
+            self._save_errors()
     
-    def _validate_row(self, row_number, row):
-        """
-        Validate a single row based on template type
-        """
-        template_type = self.template.template_type
-        
+    def _validate_file(self):
+        self.data_import.status = 'VALIDATING'
+        self.data_import.started_at = timezone.now()
+        self.data_import.save()
+
         try:
-            if template_type == 'CUSTOMERS':
-                return self._validate_customer_row(row_number, row)
-            elif template_type == 'SUPPLIERS':
-                return self._validate_supplier_row(row_number, row)
-            elif template_type == 'ITEMS':
-                return self._validate_product_row(row_number, row)
-            elif template_type == 'INVENTORY':
-                return self._validate_inventory_row(row_number, row)
-            elif template_type == 'CATEGORIES':
-                return self._validate_category_row(row_number, row)
-            elif template_type == 'LOCATIONS':
-                return self._validate_location_row(row_number, row)
-            elif template_type == 'SALES_ORDERS':
-                return self._validate_sales_order_row(row_number, row)
-            elif template_type == 'INVOICES':
-                return self._validate_invoice_row(row_number, row)
-            elif template_type == 'PAYMENTS':
-                return self._validate_payment_row(row_number, row)
-            elif template_type == 'PURCHASE_ORDERS':
-                return self._validate_purchase_order_row(row_number, row)
-            elif template_type == 'BILLS':
-                return self._validate_bill_row(row_number, row)
-            elif template_type == 'SUPPLIER_PAYMENTS':
-                return self._validate_supplier_payment_row(row_number, row)
-            elif template_type == 'ACCOUNTS':
-                return self._validate_account_row(row_number, row)
-            elif template_type == 'JOURNAL_ENTRIES':
-                return self._validate_journal_entry_row(row_number, row)
-            else:
-                self._add_error(row_number, None, 'VALIDATION_ERROR', 
-                              f"Unknown template type: {template_type}")
+            df = pd.read_excel(self.data_import.file.path).fillna('')
+        except Exception:
+            try:
+                df = pd.read_csv(self.data_import.file.path).fillna('')
+            except Exception as e:
+                self._add_error(0, f"Could not read file. Error: {e}")
                 return False
-        except Exception as e:
-            self._add_error(row_number, None, 'VALIDATION_ERROR', str(e))
-            return False
-    
-    def _import_row(self, row_number, row):
-        """
-        Import a single validated row
-        """
-        template_type = self.template.template_type
         
-        try:
-            if template_type == 'CUSTOMERS':
-                return self._import_customer_row(row_number, row)
-            elif template_type == 'SUPPLIERS':
-                return self._import_supplier_row(row_number, row)
-            elif template_type == 'ITEMS':
-                return self._import_product_row(row_number, row)
-            elif template_type == 'INVENTORY':
-                return self._import_inventory_row(row_number, row)
-            elif template_type == 'CATEGORIES':
-                return self._import_category_row(row_number, row)
-            elif template_type == 'LOCATIONS':
-                return self._import_location_row(row_number, row)
-            elif template_type == 'SALES_ORDERS':
-                return self._import_sales_order_row(row_number, row)
-            elif template_type == 'INVOICES':
-                return self._import_invoice_row(row_number, row)
-            elif template_type == 'PAYMENTS':
-                return self._import_payment_row(row_number, row)
-            elif template_type == 'PURCHASE_ORDERS':
-                return self._import_purchase_order_row(row_number, row)
-            elif template_type == 'BILLS':
-                return self._import_bill_row(row_number, row)
-            elif template_type == 'SUPPLIER_PAYMENTS':
-                return self._import_supplier_payment_row(row_number, row)
-            elif template_type == 'ACCOUNTS':
-                return self._import_account_row(row_number, row)
-            elif template_type == 'JOURNAL_ENTRIES':
-                return self._import_journal_entry_row(row_number, row)
-            else:
-                return False
-        except Exception as e:
-            self._add_error(row_number, None, 'VALIDATION_ERROR', str(e))
+        self.data_import.total_rows = len(df)
+        
+        # Validasi kolom wajib dari template
+        required_columns = self.template.required_columns
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            self._add_error(0, f"Missing required columns: {', '.join(missing_columns)}")
             return False
+
+        # Dapatkan fungsi validator berdasarkan template_type
+        validator = self._get_validator()
+        if not validator:
+            self._add_error(0, f"No validator found for template type '{self.template.template_type}'")
+            return False
+
+        for index, row in df.iterrows():
+            if not validator(index + 2, row):
+                self.data_import.failed_rows += 1
+        
+        self._save_errors()
+        self.data_import.save()
+        return self.data_import.failed_rows == 0
+
+    def _import_data(self):
+        self.data_import.status = 'PROCESSING'
+        self.data_import.save()
+
+        df = pd.read_excel(self.data_import.file.path).fillna('')
+        importer = self._get_importer()
+
+        for index, row in df.iterrows():
+            try:
+                with transaction.atomic():
+                    if importer(index + 2, row):
+                        self.data_import.successful_rows += 1
+            except Exception as e:
+                self._add_error(index + 2, f"Import failed: {str(e)}", row.to_dict())
+                self.data_import.failed_rows += 1
+        
+        self.data_import.processed_rows = self.data_import.total_rows
+        self.data_import.status = 'COMPLETED' if self.data_import.failed_rows == 0 else 'COMPLETED_WITH_ERRORS'
+        self.data_import.completed_at = timezone.now()
+        self.data_import.save()
+        self._save_errors()
+
+    # --- Helper dan Dispatcher ---
+    def _add_error(self, row_number, message, raw_data=None):
+        """Menambahkan detail error ke dalam list untuk disimpan nanti."""
+        self.errors.append(ImportErrorLog(
+            data_import=self.data_import,
+            row_number=row_number,
+            error_message=message,
+            raw_data=raw_data
+        ))
+
+    def _save_errors(self):
+        if self.errors:
+            ImportErrorLog.objects.bulk_create(self.errors)
+            self.errors = []
+
+    def _get_validator(self):
+        return getattr(self, f"_validate_{self.template.template_type.lower()}_row", None)
+
+    def _get_importer(self):
+        return getattr(self, f"_import_{self.template.template_type.lower()}_row", None)
+
+    # --- Logika Spesifik per Tipe ---
     
-    # Customer validation and import methods
-    def _validate_customer_row(self, row_number, row):
-        """Validate customer data"""
+    # PRODUCTS
+    def _validate_products_row(self, row_number, row):
         is_valid = True
-        
-        # Check required fields
-        if pd.isna(row.get('name')) or not str(row.get('name')).strip():
-            self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Customer name is required')
+        if not row.get('sku'):
+            self._add_error(row_number, "SKU is required.", row.to_dict())
             is_valid = False
-        
-        if pd.isna(row.get('email')) or not str(row.get('email')).strip():
-            self._add_error(row_number, 'email', 'VALIDATION_ERROR', 'Customer email is required')
+        elif Product.objects.filter(sku=row['sku']).exists():
+            self._add_error(row_number, f"Product with SKU '{row['sku']}' already exists.", row.to_dict())
             is_valid = False
-        else:
-            # Check for duplicate email
-            email = str(row.get('email')).strip()
-            if Customer.objects.filter(email=email).exists():
-                self._add_error(row_number, 'email', 'DUPLICATE_VALUE', f'Customer with email {email} already exists')
-                is_valid = False
-        
         return is_valid
-    
-    def _import_customer_row(self, row_number, row):
-        """Import customer data"""
-        customer = Customer.objects.create(
-            name=str(row.get('name')).strip(),
-            email=str(row.get('email')).strip(),
-            phone=str(row.get('phone', '')).strip() or None,
-            address=str(row.get('address', '')).strip() or None,
-            city=str(row.get('city', '')).strip() or None,
-            state=str(row.get('state', '')).strip() or None,
-            postal_code=str(row.get('postal_code', '')).strip() or None,
-            country=str(row.get('country', '')).strip() or None,
+
+    def _import_products_row(self, row_number, row):
+        Product.objects.create(
+            sku=row['sku'],
+            name=row['name'],
+            color=row.get('color', ''),
+            cost_price=float(row.get('cost_price', 0)) if row.get('cost_price') else 0,
+            selling_price=float(row.get('selling_price', 0)) if row.get('selling_price') else 0,
+            main_category_id=int(row['main_category_id']) if row.get('main_category_id') else None,
+            sub_category_id=int(row['sub_category_id']) if row.get('sub_category_id') else None,
         )
+        return True
+
+    # CUSTOMERS
+    def _validate_customers_row(self, row_number, row):
+        is_valid = True
+        if not row.get('email'):
+            self._add_error(row_number, "Email is required.", row.to_dict())
+            is_valid = False
+        elif Customer.objects.filter(email=row['email']).exists():
+            self._add_error(row_number, f"Customer with email '{row['email']}' already exists.", row.to_dict())
+            is_valid = False
+        return is_valid
+
+    def _import_customers_row(self, row_number, row):
+        Customer.objects.create(name=row['name'], email=row['email'], phone=row.get('phone', ''))
         return True
     
     # Supplier validation and import methods
@@ -280,6 +202,7 @@ class DataImportService:
         """Validate product data"""
         is_valid = True
         
+        # Check required fields
         if pd.isna(row.get('name')) or not str(row.get('name')).strip():
             self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Product name is required')
             is_valid = False
@@ -293,6 +216,24 @@ class DataImportService:
                 self._add_error(row_number, 'sku', 'DUPLICATE_VALUE', f'Product with SKU {sku} already exists')
                 is_valid = False
         
+        # Validate Main Category
+        main_category_name = row.get('main_category')
+        if main_category_name and not pd.isna(main_category_name):
+            try:
+                MainCategory.objects.get(name=str(main_category_name).strip())
+            except MainCategory.DoesNotExist:
+                self._add_error(row_number, 'main_category', 'FOREIGN_KEY_ERROR', f'Main Category "{main_category_name}" does not exist')
+                is_valid = False
+        
+        # Validate Sub Category
+        sub_category_name = row.get('sub_category')
+        if sub_category_name and not pd.isna(sub_category_name):
+            try:
+                SubCategory.objects.get(name=str(sub_category_name).strip())
+            except SubCategory.DoesNotExist:
+                self._add_error(row_number, 'sub_category', 'FOREIGN_KEY_ERROR', f'Sub Category "{sub_category_name}" does not exist')
+                is_valid = False
+        
         # Validate selling_price
         try:
             selling_price = float(row.get('selling_price', 0))
@@ -300,28 +241,34 @@ class DataImportService:
                 self._add_error(row_number, 'selling_price', 'VALIDATION_ERROR', 'Selling price cannot be negative')
                 is_valid = False
         except (ValueError, TypeError):
-            self._add_error(row_number, 'selling_price', 'DATA_TYPE_ERROR', 'Invalid selling_price format')
+            self._add_error(row_number, 'selling_price', 'DATA_TYPE_ERROR', 'Invalid selling price format')
             is_valid = False
+            
+        # Validate cost_price
+        cost_price = row.get('cost_price')
+        if cost_price and not pd.isna(cost_price):
+            try:
+                cost_price = float(cost_price)
+                if cost_price < 0:
+                    self._add_error(row_number, 'cost_price', 'VALIDATION_ERROR', 'Cost price cannot be negative')
+                    is_valid = False
+            except (ValueError, TypeError):
+                self._add_error(row_number, 'cost_price', 'DATA_TYPE_ERROR', 'Invalid cost price format')
+                is_valid = False
         
-        # Validate main_category if provided
-        main_category_name = row.get('main_category')
-        if main_category_name and not pd.isna(main_category_name):
-            if not MainCategory.objects.filter(name=str(main_category_name).strip()).exists():
-                self._add_error(row_number, 'main_category', 'FOREIGN_KEY_ERROR', f'MainCategory "{main_category_name}" does not exist')
-                is_valid = False
-
-        # Validate sub_category if provided
-        sub_category_name = row.get('sub_category')
-        if sub_category_name and not pd.isna(sub_category_name):
-            if not SubCategory.objects.filter(name=str(sub_category_name).strip()).exists():
-                self._add_error(row_number, 'sub_category', 'FOREIGN_KEY_ERROR', f'SubCategory "{sub_category_name}" does not exist')
-                is_valid = False
+        # Validate numeric fields (minimum_stock_level, maximum_stock_level, reorder_point, weight)
+        numeric_fields = ['minimum_stock_level', 'maximum_stock_level', 'reorder_point', 'weight', 'discount']
+        for field in numeric_fields:
+            value = row.get(field)
+            if value and not pd.isna(value):
+                try:
+                    float(value)
+                except (ValueError, TypeError):
+                    self._add_error(row_number, field, 'DATA_TYPE_ERROR', f'Invalid numeric format for {field}')
+                    is_valid = False
         
         return is_valid
-    
-    # ==============================================================================
-    # PERUBAHAN #3: Sesuaikan impor produk
-    # ==============================================================================
+
     def _import_product_row(self, row_number, row):
         """Import product data"""
         main_category = None
@@ -340,34 +287,134 @@ class DataImportService:
             description=str(row.get('description', '')).strip() or None,
             selling_price=float(row.get('selling_price', 0)),
             cost_price=float(row.get('cost_price', 0)) if row.get('cost_price') and not pd.isna(row.get('cost_price')) else 0.00,
+            discount=float(row.get('discount', 0.00)) if row.get('discount') and not pd.isna(row.get('discount')) else 0.00,
             main_category=main_category,
             sub_category=sub_category,
+            color=str(row.get('color', '')).strip() or None,
+            size=str(row.get('size', '')).strip() or None,
+            brand=str(row.get('brand', '')).strip() or None,
+            model=str(row.get('model', '')).strip() or None,
             unit_of_measure=str(row.get('unit_of_measure', 'pcs')).strip(),
-            is_active=True
+            weight=float(row.get('weight')) if row.get('weight') and not pd.isna(row.get('weight')) else None,
+            dimensions=str(row.get('dimensions', '')).strip() or None,
+            is_active=row.get('is_active', True),
+            is_sellable=row.get('is_sellable', True),
+            is_purchasable=row.get('is_purchasable', True),
+            is_manufactured=row.get('is_manufactured', False),
+            minimum_stock_level=float(row.get('minimum_stock_level', 0)) if row.get('minimum_stock_level') and not pd.isna(row.get('minimum_stock_level')) else 0,
+            maximum_stock_level=float(row.get('maximum_stock_level')) if row.get('maximum_stock_level') and not pd.isna(row.get('maximum_stock_level')) else None,
+            reorder_point=float(row.get('reorder_point', 0)) if row.get('reorder_point') and not pd.isna(row.get('reorder_point')) else 0,
+            barcode=str(row.get('barcode', '')).strip() or None,
+            supplier_code=str(row.get('supplier_code', '')).strip() or None,
+            notes=str(row.get('notes', '')).strip() or None,
         )
         return True
     
-    # Category validation and import methods
-    def _validate_category_row(self, row_number, row):
-        """Validate category data"""
+    # MainCategory validation and import methods
+    def _validate_main_category_row(self, row_number, row):
+        """Validate main category data"""
         is_valid = True
         
         if pd.isna(row.get('name')) or not str(row.get('name')).strip():
-            self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Category name is required')
+            self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Main Category name is required')
             is_valid = False
         else:
             name = str(row.get('name')).strip()
-            if Category.objects.filter(name=name).exists():
-                self._add_error(row_number, 'name', 'DUPLICATE_VALUE', f'Category with name {name} already exists')
+            if MainCategory.objects.filter(name=name).exists():
+                self._add_error(row_number, 'name', 'DUPLICATE_VALUE', f'Main Category with name {name} already exists')
+                is_valid = False
+        
+        return is_valid
+    
+    def _import_main_category_row(self, row_number, row):
+        """Import main category data"""
+        MainCategory.objects.create(
+            name=str(row.get('name')).strip(),
+            description=str(row.get('description', '')).strip() or None,
+            is_active=row.get('is_active', True)
+        )
+        return True
+
+    # SubCategory validation and import methods
+    def _validate_sub_category_row(self, row_number, row):
+        """Validate sub category data"""
+        is_valid = True
+        
+        if pd.isna(row.get('name')) or not str(row.get('name')).strip():
+            self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Sub Category name is required')
+            is_valid = False
+        else:
+            name = str(row.get('name')).strip()
+            if SubCategory.objects.filter(name=name).exists():
+                self._add_error(row_number, 'name', 'DUPLICATE_VALUE', f'Sub Category with name {name} already exists')
+                is_valid = False
+        
+        return is_valid
+    
+    def _import_sub_category_row(self, row_number, row):
+        """Import sub category data"""
+        SubCategory.objects.create(
+            name=str(row.get('name')).strip(),
+            description=str(row.get('description', '')).strip() or None,
+            is_active=row.get('is_active', True)
+        )
+        return True
+    
+    # Category (Linker) validation and import methods
+    def _validate_category_row(self, row_number, row):
+        """Validate Category (Linker) data"""
+        is_valid = True
+        
+        # Check required fields
+        if pd.isna(row.get('name')) or not str(row.get('name')).strip():
+            self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Category name is required')
+            is_valid = False
+        
+        # Validate Main Category
+        main_category_name = row.get('main_category')
+        if pd.isna(main_category_name) or not str(main_category_name).strip():
+            self._add_error(row_number, 'main_category', 'VALIDATION_ERROR', 'Main Category is required')
+            is_valid = False
+        else:
+            try:
+                MainCategory.objects.get(name=str(main_category_name).strip())
+            except MainCategory.DoesNotExist:
+                self._add_error(row_number, 'main_category', 'FOREIGN_KEY_ERROR', f'Main Category "{main_category_name}" does not exist')
+                is_valid = False
+        
+        # Validate Sub Category
+        sub_category_name = row.get('sub_category')
+        if pd.isna(sub_category_name) or not str(sub_category_name).strip():
+            self._add_error(row_number, 'sub_category', 'VALIDATION_ERROR', 'Sub Category is required')
+            is_valid = False
+        else:
+            try:
+                SubCategory.objects.get(name=str(sub_category_name).strip())
+            except SubCategory.DoesNotExist:
+                self._add_error(row_number, 'sub_category', 'FOREIGN_KEY_ERROR', f'Sub Category "{sub_category_name}" does not exist')
+                is_valid = False
+        
+        # Check for unique_together: ("main_category", "sub_category")
+        if is_valid:
+            main_cat = MainCategory.objects.get(name=str(main_category_name).strip())
+            sub_cat = SubCategory.objects.get(name=str(sub_category_name).strip())
+            if Category.objects.filter(main_category=main_cat, sub_category=sub_cat).exists():
+                self._add_error(row_number, 'main_category/sub_category', 'DUPLICATE_VALUE', f'Category link between "{main_category_name}" and "{sub_category_name}" already exists')
                 is_valid = False
         
         return is_valid
     
     def _import_category_row(self, row_number, row):
-        """Import category data"""
-        category = Category.objects.create(
+        """Import Category (Linker) data"""
+        main_category = MainCategory.objects.get(name=str(row.get('main_category')).strip())
+        sub_category = SubCategory.objects.get(name=str(row.get('sub_category')).strip())
+        
+        Category.objects.create(
             name=str(row.get('name')).strip(),
+            main_category=main_category,
+            sub_category=sub_category,
             description=str(row.get('description', '')).strip() or None,
+            is_active=row.get('is_active', True)
         )
         return True
     
@@ -379,78 +426,103 @@ class DataImportService:
         if pd.isna(row.get('name')) or not str(row.get('name')).strip():
             self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Location name is required')
             is_valid = False
+        
+        if pd.isna(row.get('code')) or not str(row.get('code')).strip():
+            self._add_error(row_number, 'code', 'VALIDATION_ERROR', 'Location code is required')
+            is_valid = False
         else:
-            name = str(row.get('name')).strip()
-            if Location.objects.filter(name=name).exists():
-                self._add_error(row_number, 'name', 'DUPLICATE_VALUE', f'Location with name {name} already exists')
+            code = str(row.get('code')).strip()
+            if Location.objects.filter(code=code).exists():
+                self._add_error(row_number, 'code', 'DUPLICATE_VALUE', f'Location with code {code} already exists')
                 is_valid = False
+        
+        # Validate location_type
+        location_type = str(row.get('location_type', 'WAREHOUSE')).strip().upper()
+        valid_types = [choice[0] for choice in Location.LOCATION_TYPES]
+        if location_type not in valid_types:
+            self._add_error(row_number, 'location_type', 'VALIDATION_ERROR', f'Invalid location type: {location_type}. Must be one of {", ".join(valid_types)}')
+            is_valid = False
+            
+        # Validate numeric fields (storage_capacity, current_utilization)
+        numeric_fields = ['storage_capacity', 'current_utilization']
+        for field in numeric_fields:
+            value = row.get(field)
+            if value and not pd.isna(value):
+                try:
+                    float(value)
+                except (ValueError, TypeError):
+                    self._add_error(row_number, field, 'DATA_TYPE_ERROR', f'Invalid numeric format for {field}')
+                    is_valid = False
         
         return is_valid
     
     def _import_location_row(self, row_number, row):
         """Import location data"""
-        location = Location.objects.create(
+        Location.objects.create(
             name=str(row.get('name')).strip(),
+            code=str(row.get('code')).strip(),
+            location_type=str(row.get('location_type', 'WAREHOUSE')).strip().upper(),
             address=str(row.get('address', '')).strip() or None,
-            city=str(row.get('city', '')).strip() or None,
-            state=str(row.get('state', '')).strip() or None,
-            postal_code=str(row.get('postal_code', '')).strip() or None,
-            country=str(row.get('country', '')).strip() or None,
+            contact_person=str(row.get('contact_person', '')).strip() or None,
+            phone=str(row.get('phone', '')).strip() or None,
+            email=str(row.get('email', '')).strip() or None,
+            is_active=row.get('is_active', True),
+            is_sellable_location=row.get('is_sellable_location', True),
+            is_purchasable_location=row.get('is_purchasable_location', True),
+            is_manufacturing_location=row.get('is_manufacturing_location', False),
+            storage_capacity=float(row.get('storage_capacity')) if row.get('storage_capacity') and not pd.isna(row.get('storage_capacity')) else None,
+            current_utilization=float(row.get('current_utilization', 0.00)) if row.get('current_utilization') and not pd.isna(row.get('current_utilization')) else 0.00,
+            notes=str(row.get('notes', '')).strip() or None,
         )
         return True
     
     # Inventory validation and import methods
     def _validate_inventory_row(self, row_number, row):
-        """Validate inventory data"""
         is_valid = True
-        
-        # Validate product exists
-        product_sku = row.get('product_sku')
-        if pd.isna(product_sku) or not str(product_sku).strip():
-            self._add_error(row_number, 'product_sku', 'VALIDATION_ERROR', 'Product SKU is required')
+        if not row.get('product_sku'):
+            self._add_error(row_number, "Product SKU is required.", row.to_dict())
             is_valid = False
         else:
-            if not Product.objects.filter(sku=str(product_sku).strip()).exists():
-                self._add_error(row_number, 'product_sku', 'FOREIGN_KEY_ERROR', f'Product with SKU "{product_sku}" does not exist')
+            try:
+                Product.objects.get(sku=row['product_sku'])
+            except Product.DoesNotExist:
+                self._add_error(row_number, f"Product with SKU '{row['product_sku']}' not found.", row.to_dict())
                 is_valid = False
         
-        # Validate warehouse exists
-        warehouse_name = row.get('warehouse')
-        if pd.isna(warehouse_name) or not str(warehouse_name).strip():
-            self._add_error(row_number, 'warehouse', 'VALIDATION_ERROR', 'Warehouse is required')
+        location_code = row.get('warehouse_code')
+
+        if not location_code:
+            self._add_error(row_number, "Location Code is required.", row.to_dict())
             is_valid = False
         else:
-            if not Warehouse.objects.filter(name=str(warehouse_name).strip()).exists():
-                self._add_error(row_number, 'warehouse', 'FOREIGN_KEY_ERROR', f'Warehouse "{warehouse_name}" does not exist')
+            try:
+                Location.objects.get(code=location_code)
+            except Location.DoesNotExist:
+                self._add_error(row_number, f"Location with code '{row['location_code']}' not found.", row.to_dict())
                 is_valid = False
         
-        # Validate quantity
         try:
-            quantity = float(row.get('quantity', 0))
-            if quantity < 0:
-                self._add_error(row_number, 'quantity', 'VALIDATION_ERROR', 'Quantity cannot be negative')
-                is_valid = False
+            float(row.get('quantity_on_hand', 0))
         except (ValueError, TypeError):
-            self._add_error(row_number, 'quantity', 'DATA_TYPE_ERROR', 'Invalid quantity format')
+            self._add_error(row_number, "Invalid format for quantity_on_hand. Must be a number.", row.to_dict())
             is_valid = False
-        
+            
         return is_valid
     
     def _import_inventory_row(self, row_number, row):
-        """Import inventory data"""
-        product = Product.objects.get(sku=str(row.get('product_sku')).strip())
-        warehouse = Warehouse.objects.get(name=str(row.get('warehouse')).strip())
-        
-        stock_level, created = StockLevel.objects.get_or_create(
+        product = Product.objects.get(sku=row['product_sku'])
+        location = Location.objects.get(code=row['warehouse_code'])
+        quantity = row.get('quantity_on_hand', 0)
+
+        stock, created = Stock.objects.get_or_create(
             product=product,
-            warehouse=warehouse,
-            defaults={'quantity': float(row.get('quantity', 0))}
+            location=location,
+            defaults={'quantity_on_hand': quantity, 'quantity_sellable': quantity}
         )
-        
         if not created:
-            stock_level.quantity = float(row.get('quantity', 0))
-            stock_level.save()
-        
+            stock.quantity_on_hand = quantity
+            stock.quantity_sellable = quantity
+            stock.save()
         return True
     
     # Sales Order validation and import methods
@@ -863,18 +935,6 @@ class DataImportService:
             is_posted=bool(row.get('is_posted', False)),
         )
         return True
-    
-    # Helper methods
-    def _add_error(self, row_number, column_name, error_type, message, raw_value=None, suggested_value=None):
-        """Add an error to the errors list"""
-        self.errors.append({
-            'row_number': row_number,
-            'column_name': column_name,
-            'error_type': error_type,
-            'error_message': message,
-            'raw_value': raw_value,
-            'suggested_value': suggested_value
-        })
     
     def _add_log(self, level, message, details=None):
         """Add a log entry"""

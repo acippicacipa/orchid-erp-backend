@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
-from .models import ImportTemplate, DataImport, ImportError, ImportLog
+from .models import ImportTemplate, DataImport, ImportLog
 from .services import DataImportService, TemplateService
 from accounts.permissions import CanImportData, CanViewImportHistory, CanDownloadTemplates
 import openpyxl
@@ -15,162 +15,61 @@ class DataUploadView(APIView):
     """
     Handle file upload for data import
     """
-    permission_classes = [IsAuthenticated, CanImportData]
+    permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
     
     def post(self, request):
+        file = request.FILES.get('file')
+        template_id = request.data.get('template_id')
+        
+        if not file:
+            return Response({
+                'error': 'No file provided'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not template_id:
+            return Response({
+                'error': 'Template ID is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get template
         try:
-            file = request.FILES.get('file')
-            template_id = request.data.get('template_id')
-            
-            if not file:
-                return Response({
-                    'error': 'No file provided'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            if not template_id:
-                return Response({
-                    'error': 'Template ID is required'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Check file extension
-            if not file.name.endswith(('.xlsx', '.xls', '.csv')):
-                return Response({
-                    'error': 'Only Excel files (.xlsx, .xls) and CSV files are supported'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Get template
-            try:
-                template = ImportTemplate.objects.get(id=template_id, is_active=True)
-            except ImportTemplate.DoesNotExist:
-                return Response({
-                    'error': 'Template not found'
-                }, status=status.HTTP_404_NOT_FOUND)
-            
-            # Create DataImport record
+            template = ImportTemplate.objects.get(id=template_id, is_active=True)
+        except ImportTemplate.DoesNotExist:
+            return Response({
+                'error': 'Template not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            # Buat record DataImport dengan relasi ke template
             data_import = DataImport.objects.create(
                 template=template,
                 file=file,
                 original_filename=file.name,
-                created_by=request.user
+                uploaded_by=request.user,
+                status='PENDING'
             )
-            
+        
             # Validate file using service
             service = DataImportService(data_import.id)
-            is_valid = service.validate_file()
-            
-            return Response({
-                'import_id': data_import.id,
-                'status': data_import.status,
-                'total_rows': data_import.total_rows,
-                'valid_rows': data_import.valid_rows,
-                'invalid_rows': data_import.invalid_rows,
-                'success_rate': data_import.success_rate,
-                'message': 'File uploaded and validated successfully' if is_valid else 'File uploaded but contains validation errors'
-            }, status=status.HTTP_200_OK)
-                
-        except Exception as e:
-            return Response({
-                'error': f'Upload failed: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-class DataValidationView(APIView):
-    """
-    Get validation results for uploaded data
-    """
-    permission_classes = [IsAuthenticated, CanViewImportHistory]
-    
-    def get(self, request):
-        try:
-            data_import_id = request.query_params.get('import_id')
-            
-            if not data_import_id:
-                return Response({
-                    'error': 'Import ID is required'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            try:
-                data_import = DataImport.objects.get(id=data_import_id, created_by=request.user)
-            except DataImport.DoesNotExist:
-                return Response({
-                    'error': 'Data import not found'
-                }, status=status.HTTP_404_NOT_FOUND)
-            
-            # Get validation errors
-            errors = ImportError.objects.filter(data_import=data_import).order_by('row_number', 'column_name')
-            
-            error_data = []
-            for error in errors:
-                error_data.append({
-                    'row_number': error.row_number,
-                    'column_name': error.column_name,
-                    'error_type': error.error_type,
-                    'error_message': error.error_message,
-                    'raw_value': error.raw_value,
-                    'suggested_value': error.suggested_value
-                })
-            
-            return Response({
-                'import_id': data_import.id,
-                'status': data_import.status,
-                'total_rows': data_import.total_rows,
-                'valid_rows': data_import.valid_rows,
-                'invalid_rows': data_import.invalid_rows,
-                'success_rate': data_import.success_rate,
-                'errors': error_data
-            }, status=status.HTTP_200_OK)
-            
-        except Exception as e:
-            return Response({
-                'error': f'Validation check failed: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-class DataImportView(APIView):
-    """
-    Import validated data
-    """
-    permission_classes = [IsAuthenticated, CanImportData]
-    
-    def post(self, request):
-        try:
-            data_import_id = request.data.get('import_id')
-            
-            if not data_import_id:
-                return Response({
-                    'error': 'Import ID is required'
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Check if import exists and belongs to user
-            try:
-                data_import = DataImport.objects.get(id=data_import_id, created_by=request.user)
-            except DataImport.DoesNotExist:
-                return Response({
-                    'error': 'Data import not found'
-                }, status=status.HTTP_404_NOT_FOUND)
-            
-            # Use service to import data
-            service = DataImportService(data_import_id)
-            success = service.import_data()
-            
-            # Refresh data_import object
+            service.process_file()
             data_import.refresh_from_db()
             
-            if success:
-                return Response({
-                    'message': 'Data imported successfully',
-                    'imported_rows': data_import.imported_rows,
-                    'status': data_import.status
-                }, status=status.HTTP_200_OK)
-            else:
-                return Response({
-                    'error': 'Import failed. Check logs for details.',
-                    'status': data_import.status
-                }, status=status.HTTP_400_BAD_REQUEST)
-                
-        except Exception as e:
             return Response({
-                'error': f'Import failed: {str(e)}'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                'import_id': data_import.id,
+                'status': data_import.status,
+                'total_rows': data_import.total_rows,
+                'successful_rows': data_import.successful_rows,
+                'failed_rows': data_import.failed_rows,
+                'message': 'File processed successfully.'
+            }, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            # Log error untuk debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Upload failed: {e}", exc_info=True)
+            return Response({'error': f'An unexpected error occurred: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class TemplateDownloadView(APIView):
     """
@@ -226,19 +125,86 @@ class TemplateDownloadView(APIView):
             
             # Add sample data row based on template type
             sample_data = {}
-            if template.template_type == 'CATEGORIES':
+            if template.template_type == 'MAIN_CATEGORIES':
                 sample_data = {
-                    'name': 'Electronics',
-                    'code': 'ELEC',
-                    'description': 'Electronic gadgets and devices',
-                    'parent_code': ''
+                    'name': 'Barang Lokal',
+                    'description': 'Kategori untuk barang yang diproduksi di dalam negeri',
+                    'is_active': True
+                }
+            elif template.template_type == 'SUB_CATEGORIES':
+                sample_data = {
+                    'name': 'Bunga',
+                    'description': 'Sub-kategori untuk produk bunga',
+                    'is_active': True
+                }
+            elif template.template_type == 'CATEGORIES':
+                sample_data = {
+                    'name': 'Bunga Lokal',
+                    'main_category': 'Barang Lokal',
+                    'sub_category': 'Bunga',
+                    'description': 'Kategori gabungan Bunga Lokal',
+                    'is_active': True
                 }
             elif template.template_type == 'LOCATIONS':
                 sample_data = {
-                    'name': 'Main Warehouse',
-                    'code': 'WH001',
+                    'name': 'Gudang Utama',
+                    'code': 'GU001',
                     'location_type': 'WAREHOUSE',
-                    'description': 'Primary storage facility'
+                    'address': 'Jl. Merdeka No. 1',
+                    'contact_person': 'Budi',
+                    'phone': '08123456789',
+                    'email': 'gudang@example.com',
+                    'is_active': True,
+                    'is_sellable_location': True,
+                    'is_purchasable_location': True,
+                    'is_manufacturing_location': False,
+                    'storage_capacity': 1000.00,
+                    'current_utilization': 0.00,
+                    'notes': 'Gudang utama untuk semua stok'
+                }
+            elif template.template_type == 'ITEMS':
+                sample_data = {
+                    'name': 'Mawar Merah',
+                    'sku': 'MR-001',
+                    'description': 'Bunga Mawar Merah Lokal',
+                    'main_category': 'Barang Lokal',
+                    'sub_category': 'Bunga',
+                    'color': 'Merah',
+                    'size': 'Besar',
+                    'brand': 'Flora Nusantara',
+                    'model': 'Mawar',
+                    'cost_price': 10000.00,
+                    'selling_price': 15000.00,
+                    'discount': 0.00,
+                    'unit_of_measure': 'tangkai',
+                    'weight': 0.1,
+                    'dimensions': '10x5x50',
+                    'is_active': True,
+                    'is_sellable': True,
+                    'is_purchasable': True,
+                    'is_manufactured': False,
+                    'minimum_stock_level': 10,
+                    'maximum_stock_level': 100,
+                    'reorder_point': 20,
+                    'barcode': '1234567890123',
+                    'supplier_code': 'SUP-MR-001',
+                    'notes': 'Produk unggulan'
+                }
+            elif template.template_type == 'INVENTORY':
+                sample_data = {
+                    'product_sku': 'MR-001',
+                    'location_code': 'GU001',
+                    'quantity_on_hand': 50.00,
+                    'quantity_sellable': 50.00,
+                    'quantity_non_sellable': 0.00,
+                    'quantity_reserved': 0.00,
+                    'quantity_allocated': 0.00,
+                    'average_cost': 10000.00,
+                    'last_cost': 10000.00,
+                    'bin_location': 'A-01-01',
+                    'lot_number': 'LOT-20231027',
+                    'expiry_date': '2024-12-31',
+                    'notes': 'Stok awal'
                 }
             elif template.template_type == 'CUSTOMERS':
                 sample_data = {
@@ -469,6 +435,11 @@ class ImportHistoryView(APIView):
             
             import_data = []
             for data_import in imports:
+                success_rate = 0
+                if data_import.total_rows > 0:
+                    # Gunakan successful_rows untuk menghitung rate
+                    success_rate = round((data_import.successful_rows / data_import.total_rows) * 100, 2)
+
                 import_data.append({
                     'id': data_import.id,
                     'template_name': data_import.template.name,
@@ -476,14 +447,19 @@ class ImportHistoryView(APIView):
                     'original_filename': data_import.original_filename,
                     'status': data_import.status,
                     'total_rows': data_import.total_rows,
-                    'valid_rows': data_import.valid_rows,
-                    'invalid_rows': data_import.invalid_rows,
-                    'imported_rows': data_import.imported_rows,
-                    'success_rate': data_import.success_rate,
+                    
+                    # Ganti field yang salah dengan yang benar
+                    'successful_rows': data_import.successful_rows, # Ganti 'valid_rows' dan 'imported_rows'
+                    'failed_rows': data_import.failed_rows,       # Ganti 'invalid_rows'
+                    'processed_rows': data_import.processed_rows,
+                    
+                    # Gunakan success_rate yang baru dihitung
+                    'success_rate': success_rate,
+                    
                     'created_at': data_import.created_at,
                     'started_at': data_import.started_at,
                     'completed_at': data_import.completed_at,
-                    'created_by': data_import.created_by.username if data_import.created_by else None
+                    'uploaded_by': data_import.uploaded_by.username if data_import.uploaded_by else None
                 })
             
             return Response({
@@ -494,6 +470,33 @@ class ImportHistoryView(APIView):
             return Response({
                 'error': f'Failed to get import history: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def delete(self, request, import_id):
+        """
+        Menangani permintaan DELETE untuk menghapus satu record DataImport.
+        """
+        try:
+            # Cari record import yang akan dihapus.
+            # Filter juga berdasarkan pengguna jika Anda tidak ingin admin bisa menghapus milik semua orang.
+            # import_to_delete = DataImport.objects.get(id=import_id, uploaded_by=request.user)
+            import_to_delete = DataImport.objects.get(id=import_id)
+            
+            # Hapus objek dari database.
+            # File fisik yang terkait (di folder media) juga akan terhapus jika
+            # Anda menggunakan Django-Cleanup atau menangani sinyal post_delete.
+            # Untuk saat ini, kita hanya hapus record database.
+            import_to_delete.delete()
+            
+            # Kirim respons sukses tanpa konten.
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        except DataImport.DoesNotExist:
+            return Response({'error': 'Import record not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to delete import record {import_id}: {e}", exc_info=True)
+            return Response({'error': f'An unexpected error occurred: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class ImportLogsView(APIView):
