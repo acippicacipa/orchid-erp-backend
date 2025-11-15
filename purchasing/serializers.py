@@ -22,10 +22,12 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
 class PurchaseOrderSerializer(serializers.ModelSerializer):
     items = PurchaseOrderItemSerializer(many=True)
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
+    supplier_email = serializers.CharField(source='supplier.email', read_only=True)
+    supplier_phone = serializers.CharField(source='supplier.phone', read_only=True)
 
     class Meta:
         model = PurchaseOrder
-        fields = ["id", "supplier", "supplier_name", "order_date", "expected_delivery_date", "order_number", "status", "total_amount", "notes", "items", "created_at", "updated_at"]
+        fields = ["id", "supplier", "supplier_name", "supplier_phone", "supplier_email", "order_date", "expected_delivery_date", "order_number", "status", "total_amount", "notes", "items", "created_at", "updated_at"]
 
     def create(self, validated_data):
         items_data = validated_data.pop('items')

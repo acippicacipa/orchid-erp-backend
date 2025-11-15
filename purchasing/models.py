@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 from common.models import BaseModel, Address, Contact
 
 class Supplier(BaseModel):
@@ -38,6 +39,13 @@ class PurchaseOrder(BaseModel):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="DRAFT")
     total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
     notes = models.TextField(blank=True, null=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="purchase_orders_approved"
+    )
 
     class Meta:
         verbose_name = "Purchase Order"
