@@ -2,7 +2,8 @@ from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
-from django.db.models import Sum, F, ExpressionWrapper, DecimalField, Q
+from django.db.models import Sum, F, ExpressionWrapper, DecimalField, Q, OuterRef, Subquery, Value, Case, When
+from django.db.models.functions import Coalesce
 from django.db import transaction
 from django.utils import timezone
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ from .serializers import (
     ProductSearchSerializer, DownPaymentSerializer, DownPaymentUsageSerializer,
     CustomerDownPaymentSummarySerializer, DeliveryOrderSerializer, CreateConsolidatedInvoiceSerializer, InvoicePrintItemSerializer
 )
+
 from inventory.models import Product
 from decimal import Decimal, InvalidOperation
 from collections import defaultdict
