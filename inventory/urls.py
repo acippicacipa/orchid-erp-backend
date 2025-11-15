@@ -4,7 +4,8 @@ from .views import (
     MainCategoryViewSet, SubCategoryViewSet, CategoryViewSet, 
     LocationViewSet, ProductViewSet, StockViewSet,
     BillOfMaterialsViewSet, BOMItemViewSet, 
-    AssemblyOrderViewSet, AssemblyOrderItemViewSet, StockMovementViewSet, GoodsReceiptViewSet
+    AssemblyOrderViewSet, AssemblyOrderItemViewSet, StockMovementViewSet, GoodsReceiptViewSet, ProductSearchViewSet,
+    StockTransferViewSet
 )
 
 router = DefaultRouter()
@@ -20,6 +21,8 @@ router.register(r'bom-items', BOMItemViewSet)
 router.register(r'assembly-orders', AssemblyOrderViewSet)
 router.register(r'assembly-order-items', AssemblyOrderItemViewSet)
 router.register(r'goods-receipts', GoodsReceiptViewSet)
+router.register(r'product-search', ProductSearchViewSet, basename='inventory-product-search')
+router.register(r'stock-transfers', StockTransferViewSet, basename='stock-transfer')
 
 urlpatterns = [
     path('', include(router.urls)),

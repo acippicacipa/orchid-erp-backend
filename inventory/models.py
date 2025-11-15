@@ -482,37 +482,73 @@ class GoodsReceiptItem(BaseModel):
             
             stock.save()
 
+class StockTransfer(BaseModel):
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('IN_TRANSIT', 'In Transit'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+    transfer_number = models.CharField(max_length=50, unique=True, blank=True)
+    from_location = models.ForeignKey('Location', related_name='transfers_out', on_delete=models.PROTECT)
+    to_location = models.ForeignKey('Location', related_name='transfers_in', on_delete=models.PROTECT)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    notes = models.TextField(blank=True, null=True)
+    # Tambahkan field user jika perlu
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='stock_transfers_created')
+    
+    def save(self, *args, **kwargs):
+        if not self.transfer_number:
+            # Logika pembuatan nomor transfer
+            today_str = timezone.now().strftime('%Y%m%d')
+            last_transfer = StockTransfer.objects.filter(transfer_number__startswith=f"TR-{today_str}").order_by('transfer_number').last()
+            new_num = 1
+            if last_transfer:
+                last_num_str = last_transfer.transfer_number.split('-')[-1]
+                new_num = int(last_num_str) + 1
+            self.transfer_number = f"TR-{today_str}-{new_num:03d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.transfer_number
+
+class StockTransferItem(BaseModel):
+    stock_transfer = models.ForeignKey(StockTransfer, related_name='items', on_delete=models.CASCADE)
+    product = models.ForeignKey('Product', on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=12, decimal_places=2)
+
+    def __str__(self):
+        return f"{self.product.name} ({self.quantity}) for {self.stock_transfer.transfer_number}"
+
+# --- MODIFIKASI MODEL StockMovement ---
+# Model ini sekarang menjadi lebih generik dan kuat
+
 class StockMovement(BaseModel):
     MOVEMENT_TYPES = [
         ('RECEIPT', 'Goods Receipt'),
         ('SALE', 'Sale'),
         ('ADJUSTMENT', 'Stock Adjustment'),
-        ('TRANSFER', 'Stock Transfer'),
-        ('ASSEMBLY', 'Assembly/Manufacturing'),
+        ('TRANSFER_OUT', 'Transfer Out'), # Lebih spesifik
+        ('TRANSFER_IN', 'Transfer In'),   # Lebih spesifik
         ('RETURN', 'Return'),
         ('DAMAGE', 'Damage/Loss'),
     ]
 
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='movements')
-    location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='movements')
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='movements')
+    location = models.ForeignKey('Location', on_delete=models.CASCADE, related_name='movements')
     movement_type = models.CharField(max_length=20, choices=MOVEMENT_TYPES)
-    quantity = models.DecimalField(max_digits=12, decimal_places=2)
+    quantity = models.DecimalField(max_digits=12, decimal_places=2) # Negatif untuk keluar, Positif untuk masuk
     unit_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    reference_number = models.CharField(max_length=100, blank=True, null=True)
-    reference_type = models.CharField(max_length=50, blank=True, null=True)  # 'GOODS_RECEIPT', 'SALES_ORDER', etc.
+    
+    # Reference fields untuk melacak sumber pergerakan
+    reference_number = models.CharField(max_length=100, blank=True, null=True, db_index=True)
+    reference_type = models.CharField(max_length=50, blank=True, null=True) # Misal: 'STOCK_TRANSFER', 'SALES_ORDER'
+    
     notes = models.TextField(blank=True, null=True)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, # <-- UBAH INI
-        on_delete=models.SET_NULL, 
-        null=True, 
-        blank=True
-    )
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
     movement_date = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        verbose_name = "Stock Movement"
-        verbose_name_plural = "Stock Movements"
-        db_table = "inventory_stock_movements"
         ordering = ['-movement_date', '-created_at']
 
     def __str__(self):

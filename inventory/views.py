@@ -3,7 +3,9 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import AllowAny
-from django.db.models import Q, F, Sum
+from accounts.permissions import IsAdminOrSales
+from django.db.models import Q, F, Sum, Subquery, OuterRef, DecimalField, Value, Case, When
+from django.db.models.functions import Coalesce
 from django_filters.rest_framework import DjangoFilterBackend
 from accounts.permissions import IsAdminOrWarehouse
 from django.db import transaction, models
@@ -14,14 +16,15 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from .models import (
     MainCategory, SubCategory, Category, Location, Product, Stock, 
-    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockMovement, GoodsReceipt, GoodsReceiptItem
+    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockMovement, GoodsReceipt, GoodsReceiptItem, StockTransfer, StockTransferItem
 )
 from .serializers import (
     MainCategorySerializer, SubCategorySerializer, CategorySerializer, 
     LocationSerializer, ProductSerializer, StockSerializer,
     BillOfMaterialsSerializer, BOMItemSerializer, 
     AssemblyOrderSerializer, AssemblyOrderItemSerializer, StockMovementSerializer, GoodsReceiptSerializer, CreateGoodsReceiptSerializer, 
-    PurchaseOrderForReceiptSerializer, AssemblyOrderForReceiptSerializer
+    PurchaseOrderForReceiptSerializer, AssemblyOrderForReceiptSerializer, CreateBulkMovementSerializer, InventoryProductSearchSerializer,
+    StockTransferSerializer
 )
 
 class MainCategoryViewSet(viewsets.ModelViewSet):
@@ -817,15 +820,16 @@ class StockMovementViewSet(viewsets.ModelViewSet):
     queryset = StockMovement.objects.all()
     serializer_class = StockMovementSerializer
     permission_classes = [IsAdminOrWarehouse] # Sesuaikan dengan izin yang Anda inginkan
+    filter_backends = [filters.SearchFilter, DjangoFilterBackend] # DjangoFilterBackend jika Anda juga filter by field
+    search_fields = ['reference_number', 'product__name', 'product__sku']
+    filterset_fields = ['movement_type', 'location', 'product']
 
     def get_queryset(self):
         """
         Filter queryset berdasarkan query params.
         Contoh: /api/inventory/stock-movements/?product=1&location=2
         """
-        queryset = StockMovement.objects.select_related(
-            'product', 'location', 'user', 'created_by'
-        ).all()
+        queryset = super().get_queryset()
 
         # Ambil parameter dari URL
         product_id = self.request.query_params.get('product', None)
@@ -862,12 +866,173 @@ class StockMovementViewSet(viewsets.ModelViewSet):
         """
         serializer.save(updated_by=self.request.user)
 
+    @action(detail=False, methods=['post'], url_path='create_bulk')
+    @transaction.atomic
+    def create_bulk_movement(self, request):
+        """
+        Membuat beberapa stock movement sekaligus dari satu request.
+        Menangani logika untuk TRANSFER, ADJUSTMENT, DAMAGE, dll.
+        """
+        serializer = CreateBulkMovementSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        movement_type = data['movement_type']
+        from_location = data['location']
+        to_location = data.get('to_location')
+        items = data['items']
+        
+        reference_number = data.get('reference_number')
+        if movement_type == 'TRANSFER' and not reference_number:
+            # Buat nomor referensi otomatis untuk transfer
+            today_str = timezone.now().strftime('%Y%m%d')
+            prefix = f"TRF-{today_str}-"
+            last_movement = StockMovement.objects.filter(
+                reference_number__startswith=prefix
+            ).order_by('-reference_number').first()
+            
+            if last_movement:
+                try:
+                    last_seq = int(last_movement.reference_number.split('-')[-1])
+                    new_seq = last_seq + 1
+                except (ValueError, IndexError):
+                    new_seq = 1
+            else:
+                new_seq = 1
+            
+            reference_number = f"{prefix}{new_seq:04d}"
+
+        created_movements = []
+
+        for item_data in items:
+            product = item_data['product']
+            quantity = item_data['quantity']
+            
+            # Ambil cost dari produk, default 0 jika tidak ada
+            unit_cost = product.cost_price or Decimal('0.00')
+
+            if movement_type == 'TRANSFER':
+                # Untuk transfer, buat dua movement: satu keluar, satu masuk
+                
+                # 1. Movement KELUAR dari `from_location`
+                out_movement = StockMovement.objects.create(
+                    product=product,
+                    location=from_location,
+                    movement_type=movement_type,
+                    quantity=-abs(quantity), # Pastikan negatif
+                    unit_cost=unit_cost,
+                    notes=data.get('notes', f"Transfer to {to_location.name}"),
+                    reference_number=reference_number,
+                    user=request.user
+                )
+                created_movements.append(out_movement)
+
+                # 2. Movement MASUK ke `to_location`
+                in_movement = StockMovement.objects.create(
+                    product=product,
+                    location=to_location,
+                    movement_type=movement_type,
+                    quantity=abs(quantity), # Pastikan positif
+                    unit_cost=unit_cost,
+                    notes=data.get('notes', f"Transfer from {from_location.name}"),
+                    reference_number=reference_number,
+                    user=request.user
+                )
+                created_movements.append(in_movement)
+
+            else: # Untuk tipe lain (ADJUSTMENT, DAMAGE, RECEIPT)
+                # Tentukan apakah kuantitas harus positif atau negatif
+                if movement_type in ['DAMAGE', 'SALE']:
+                    # Jika barang rusak atau dijual, kuantitasnya mengurangi stok
+                    final_quantity = -abs(quantity)
+                else:
+                    # Jika adjustment positif atau receipt, kuantitas menambah stok
+                    final_quantity = abs(quantity)
+
+                movement = StockMovement.objects.create(
+                    product=product,
+                    location=from_location,
+                    movement_type=movement_type,
+                    quantity=final_quantity,
+                    unit_cost=unit_cost,
+                    notes=data.get('notes'),
+                    reference_number=reference_number,
+                    user=request.user
+                )
+                created_movements.append(movement)
+
+        # Serialize data yang baru dibuat untuk respons
+        response_serializer = StockMovementSerializer(created_movements, many=True)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['get'], url_path='transfer-history')
+    def transfer_history(self, request):
+        """
+        Mengembalikan daftar riwayat transfer yang sudah dikelompokkan per nomor referensi.
+        """
+        search_query = request.query_params.get('search', None)
+
+        # Ambil semua movement transfer, urutkan berdasarkan referensi dan tanggal
+        movements = StockMovement.objects.filter(movement_type='TRANSFER').order_by('-movement_date', 'reference_number')
+
+        if search_query:
+            movements = movements.filter(
+                Q(reference_number__icontains=search_query) |
+                Q(notes__icontains=search_query) |
+                Q(product__name__icontains=search_query)
+            ).distinct()
+
+        # Gunakan pagination dari DRF
+        paginator = self.pagination_class()
+        paginated_movements = paginator.paginate_queryset(movements, request)
+
+        # Kelompokkan hasil dari halaman saat ini
+        grouped_transfers = {}
+        for mov in paginated_movements:
+            ref = mov.reference_number
+            if ref not in grouped_transfers:
+                grouped_transfers[ref] = {
+                    'reference_number': ref,
+                    'date': mov.movement_date,
+                    'user': mov.user.username if mov.user else 'System',
+                    'notes': mov.notes,
+                    'from_location': 'N/A',
+                    'to_location': 'N/A',
+                    'items': []
+                }
+            
+            # Tentukan lokasi asal dan tujuan
+            if mov.quantity < 0:
+                grouped_transfers[ref]['from_location'] = mov.location.name
+            else:
+                grouped_transfers[ref]['to_location'] = mov.location.name
+            
+            # Cek agar tidak ada duplikasi item (jika satu item muncul dua kali)
+            if not any(item['product_id'] == mov.product.id for item in grouped_transfers[ref]['items']):
+                grouped_transfers[ref]['items'].append({
+                    'product_id': mov.product.id,
+                    'product_name': mov.product.name,
+                    'product_sku': mov.product.sku,
+                    'quantity': abs(mov.quantity)
+                })
+
+        # Kembalikan hasil dalam format paginasi DRF
+        return paginator.get_paginated_response(list(grouped_transfers.values()))
+
 class GoodsReceiptViewSet(viewsets.ModelViewSet):
     queryset = GoodsReceipt.objects.all().select_related(
         'purchase_order', 'assembly_order', 'supplier', 'location', 'received_by'
     )
     serializer_class = GoodsReceiptSerializer
     permission_classes = [AllowAny]
+
+    filter_backends = [filters.SearchFilter]
+    search_fields = [
+        'receipt_number', 
+        'purchase_order__order_number', 
+        'assembly_order__order_number',
+        'supplier__name'
+    ]
     
     def get_serializer_class(self):
         # Gunakan serializer yang sudah dimodifikasi
@@ -1077,3 +1242,212 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
         )
         serializer = StockMovementSerializer(movements, many=True)
         return Response(serializer.data)
+
+class ProductSearchViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for product search in sales orders
+    """
+    queryset = Product.objects.filter(is_active=True)
+    serializer_class = InventoryProductSearchSerializer
+    permission_classes = [IsAdminOrSales]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name', 'sku']
+
+    def get_queryset(self):
+        """
+        Fungsi ini sekarang akan dipanggil oleh action 'search' kita.
+        Ia akan menganotasi queryset dengan stok yang benar.
+        """
+        queryset = super().get_queryset()
+        location_id_str = self.request.query_params.get('location_id', None)
+
+        if location_id_str:
+            try:
+                location_id = int(location_id_str)
+                stock_subquery = Stock.objects.filter(
+                    product=OuterRef('pk'),
+                    location_id=location_id
+                ).values('quantity_on_hand')[:1]
+
+                queryset = queryset.annotate(
+                    current_stock=Coalesce(
+                        Subquery(stock_subquery, output_field=DecimalField()),
+                        Value(Decimal('0.00')),
+                        output_field=DecimalField()
+                    )
+                )
+            except (ValueError, TypeError):
+                queryset = queryset.annotate(current_stock=Value(Decimal('0.00'), output_field=DecimalField()))
+        else:
+            queryset = queryset.annotate(current_stock=Value(Decimal('0.00'), output_field=DecimalField()))
+            
+        return queryset
+
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        """
+        Action pencarian yang sekarang menggunakan queryset utama dan filter backend.
+        """
+        queryset = self.get_queryset()
+        
+        # filter_queryset akan otomatis membaca 'search' dari request.query_params
+        filtered_queryset = self.filter_queryset(queryset)
+
+        paginated_queryset = filtered_queryset[:20]
+
+        serializer = self.get_serializer(paginated_queryset, many=True)
+        
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'], url_path='calculate-price')
+    def calculate_price(self, request, pk=None):
+        """
+        Calculates the price and discount for a product based on customer and quantity.
+        Expects 'customer_id' and 'quantity' as query parameters.
+        """
+        product = self.get_object()
+        
+        customer_id = request.query_params.get('customer_id')
+        quantity_str = request.query_params.get('quantity', '1')
+
+        if not customer_id:
+            return Response(
+                {'error': 'customer_id is required'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            customer = Customer.objects.get(pk=customer_id)
+        except Customer.DoesNotExist:
+            return Response({'error': f"Customer with ID {customer_id} not found"}, status=status.HTTP_404_NOT_FOUND)
+        except (ValueError, TypeError):
+             return Response({'error': 'Invalid customer_id format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 2. Validasi Kuantitas secara terpisah
+        try:
+            quantity = Decimal(quantity_str)
+            if quantity <= 0:
+                raise InvalidOperation("Quantity must be positive.")
+        except InvalidOperation as e: # Tangkap error konversi Decimal secara spesifik
+            return Response({'error': f"Invalid quantity: {e}"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Jika semua validasi lolos, panggil service
+        pricing_data = PricingService.get_price_and_discount(customer, product, quantity)
+        
+        return Response(pricing_data)
+
+class StockTransferViewSet(viewsets.ModelViewSet):
+    queryset = StockTransfer.objects.prefetch_related('items', 'items__product', 'created_by').all().order_by('-created_at')
+    serializer_class = StockTransferSerializer
+    permission_classes = [IsAuthenticated] # Pastikan hanya user terautentikasi yang bisa akses
+
+    def perform_create(self, serializer):
+        """
+        Secara otomatis mengatur 'created_by' saat membuat transfer baru.
+        """
+        serializer.save(created_by=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        """
+        Override metode create untuk memastikan data diambil dari request.data.
+        """
+        # 1. Ambil data dari body request (JSON)
+        data = request.data
+        
+        # 2. Inisialisasi serializer dengan data dari body
+        serializer = self.get_serializer(data=data)
+        
+        # 3. Validasi data
+        serializer.is_valid(raise_exception=True)
+        
+        # 4. Panggil perform_create (yang akan mengisi 'created_by') dan simpan
+        self.perform_create(serializer)
+        
+        # 5. Siapkan header dan kembalikan respons sukses
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    @action(detail=True, methods=['post'], url_path='send') # Ganti nama dari 'dispatch' menjadi 'send'
+    def send(self, request, pk=None):
+        """
+        Action untuk mengirim transfer. Mengubah status ke IN_TRANSIT dan
+        membuat StockMovement negatif (keluar) dari lokasi asal.
+        """
+        transfer = self.get_object()
+        if transfer.status != 'PENDING':
+            return Response({'detail': f'Transfer is already {transfer.status}, cannot dispatch.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            movements_to_create = []
+            for item in transfer.items.all():
+                # Validasi: Pastikan stok di lokasi asal mencukupi
+                stock, created = Stock.objects.get_or_create(
+                    product=item.product,
+                    location=transfer.from_location,
+                    defaults={'quantity_on_hand': Decimal('0.00')}
+                )
+                if stock.quantity_on_hand < item.quantity:
+                    raise serializers.ValidationError(
+                        f"Insufficient stock for {item.product.name} at {transfer.from_location.name}. "
+                        f"Required: {item.quantity}, Available: {stock.quantity_on_hand}."
+                    )
+
+                movements_to_create.append(
+                    StockMovement(
+                        product=item.product,
+                        location=transfer.from_location,
+                        movement_type='TRANSFER_OUT',
+                        quantity=-item.quantity,  # Kuantitas negatif
+                        reference_number=transfer.transfer_number,
+                        reference_type='STOCK_TRANSFER',
+                        user=request.user,
+                        notes=f"Dispatch to {transfer.to_location.name}"
+                    )
+                )
+            
+            for movement_data in movements_to_create:
+                movement_data.save()
+            
+            # Update status transfer
+            transfer.status = 'IN_TRANSIT'
+            transfer.save(update_fields=['status', 'updated_at'])
+            
+        serializer = self.get_serializer(transfer)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='receive')
+    def receive(self, request, pk=None):
+        """
+        Action untuk menerima transfer. Mengubah status ke COMPLETED dan
+        membuat StockMovement positif (masuk) ke lokasi tujuan.
+        """
+        transfer = self.get_object()
+        if transfer.status != 'IN_TRANSIT':
+            return Response({'detail': f'Transfer is not IN_TRANSIT, cannot receive.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            movements_to_create = []
+            for item in transfer.items.all():
+                movements_to_create.append(
+                    StockMovement(
+                        product=item.product,
+                        location=transfer.to_location,
+                        movement_type='TRANSFER_IN',
+                        quantity=item.quantity,  # Kuantitas positif
+                        reference_number=transfer.transfer_number,
+                        reference_type='STOCK_TRANSFER',
+                        user=request.user,
+                        notes=f"Receipt from {transfer.from_location.name}"
+                    )
+                )
+            
+            # Buat semua movement. Sinyal post_save akan otomatis mengupdate stok.
+            for movement_data in movements_to_create:
+                movement_data.save()
+            
+            # Update status transfer
+            transfer.status = 'COMPLETED'
+            transfer.save(update_fields=['status', 'updated_at'])
+            
+        serializer = self.get_serializer(transfer)
+        return Response(serializer.data, status=status.HTTP_200_OK)

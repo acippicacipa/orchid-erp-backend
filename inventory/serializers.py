@@ -1,9 +1,9 @@
 from rest_framework import serializers
 from .models import (
     MainCategory, SubCategory, Category, Location, Product, Stock, 
-    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem
+    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockTransfer, StockTransferItem
 )
-from django.db import models
+from django.db import models, transaction
 
 class MainCategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -407,3 +407,145 @@ class AssemblyOrderForReceiptSerializer(serializers.ModelSerializer):
         # Sisa adalah jumlah yang sudah diproduksi dikurangi yang sudah diterima
         remaining = obj.quantity_produced - total_received
         return remaining if remaining > 0 else 0
+
+class BulkMovementItemSerializer(serializers.Serializer):
+    """Serializer untuk satu item di dalam bulk movement."""
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+    def validate_quantity(self, value):
+        if value == 0:
+            raise serializers.ValidationError("Quantity cannot be zero.")
+        return value
+
+class CreateBulkMovementSerializer(serializers.Serializer):
+    """Serializer untuk memvalidasi payload create_bulk_movement."""
+    movement_type = serializers.ChoiceField(choices=StockMovement.MOVEMENT_TYPES)
+    location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.all())
+    to_location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.all(), required=False, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+    reference_number = serializers.CharField(required=False, allow_blank=True)
+    items = BulkMovementItemSerializer(many=True)
+
+    def validate(self, data):
+        """Validasi level objek."""
+        movement_type = data.get('movement_type')
+        location = data.get('location')
+        to_location = data.get('to_location')
+
+        if movement_type == 'TRANSFER':
+            if not to_location:
+                raise serializers.ValidationError({"to_location": "This field is required for TRANSFER movements."})
+            if location == to_location:
+                raise serializers.ValidationError("From and To locations cannot be the same for a transfer.")
+        
+        if not data.get('items'):
+            raise serializers.ValidationError({"items": "At least one item is required."})
+            
+        return data
+
+class InventoryProductSearchSerializer(serializers.ModelSerializer):
+    """Serializer for product search in sales orders"""
+    category_path = serializers.CharField(read_only=True)
+    current_stock = serializers.DecimalField(
+        max_digits=12, 
+        decimal_places=2, 
+        read_only=True
+    )
+    
+    class Meta:
+        model = Product
+        # Sesuaikan fields dengan yang dibutuhkan frontend
+        fields = [
+            'id', 
+            'name',
+            'color',
+            'full_name',  
+            'sku', 
+            'selling_price', # Frontend butuh ini
+            'category_path', # Ganti dari category_name
+            'current_stock',
+            'is_sellable', # Tambahkan ini untuk filtering di frontend jika perlu
+            'unit_of_measure' # Ganti dari 'unit'
+        ]
+
+class StockTransferItemSerializer(serializers.ModelSerializer):
+    # Gunakan PrimaryKeyRelatedField untuk input, tapi tampilkan nama untuk output
+    product_name = serializers.CharField(source='product.full_name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+
+    class Meta:
+        model = StockTransferItem
+        fields = [
+            'id',
+            'product', 
+            'product_name',
+            'product_sku',
+            'quantity'
+        ]
+        # 'product' akan digunakan untuk menulis (menerima ID produk),
+        # sedangkan 'product_name' dan 'product_sku' untuk membaca.
+
+# Serializer utama untuk StockTransfer
+class StockTransferSerializer(serializers.ModelSerializer):
+    # Nested serializer untuk items. 'many=True' karena ada banyak item.
+    items = StockTransferItemSerializer(many=True)
+    
+    # Representasi read-only untuk menampilkan nama, bukan hanya ID
+    from_location_name = serializers.CharField(source='from_location.name', read_only=True)
+    to_location_name = serializers.CharField(source='to_location.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True, default='')
+
+    class Meta:
+        model = StockTransfer
+        fields = [
+            'id',
+            'transfer_number',
+            'from_location',
+            'from_location_name',
+            'to_location',
+            'to_location_name',
+            'status',
+            'notes',
+            'created_by',
+            'created_by_name',
+            'created_at',
+            'updated_at',
+            'items' # Nested items
+        ]
+        # Definisikan field yang hanya untuk dibaca (read-only)
+        read_only_fields = [
+            'transfer_number', 
+            'status', 
+            'created_at', 
+            'updated_at',
+            'created_by'
+        ]
+
+    def validate(self, data):
+        """
+        Validasi level objek untuk memastikan lokasi tidak sama.
+        """
+        if data['from_location'] == data['to_location']:
+            raise serializers.ValidationError("From and To locations cannot be the same.")
+        
+        if not data.get('items'):
+            raise serializers.ValidationError({"items": "At least one item is required for a transfer."})
+            
+        return data
+
+    def create(self, validated_data):
+        """
+        Override metode create untuk menangani pembuatan nested items.
+        """
+        items_data = validated_data.pop('items')
+        
+        with transaction.atomic():
+            # Buat objek StockTransfer utama
+            transfer = StockTransfer.objects.create(**validated_data)
+            
+            # Buat objek StockTransferItem untuk setiap item dalam data
+            for item_data in items_data:
+                StockTransferItem.objects.create(stock_transfer=transfer, **item_data)
+                
+        return transfer
