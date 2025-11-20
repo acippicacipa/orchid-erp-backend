@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db import transaction
 from django.db import models
+from django.db.models import Q
 from accounts.permissions import IsAdminOrPurchasing
 from .models import Supplier, PurchaseOrder, PurchaseOrderItem, Bill, SupplierPayment
 from .serializers import SupplierSerializer, SupplierListSerializer, PurchaseOrderSerializer, PurchaseOrderItemSerializer, BillSerializer, SupplierPaymentSerializer
@@ -21,7 +22,10 @@ class SupplierViewSet(viewsets.ModelViewSet):
         queryset = Supplier.objects.all()
         search = self.request.query_params.get('search', None)
         if search:
-            queryset = queryset.filter(name__icontains=search)
+            queryset = queryset.filter(
+                Q(name__icontains=search) | 
+                Q(contact_person__icontains=search)
+            )
         return queryset.order_by('name')
 
 class PurchaseOrderViewSet(viewsets.ModelViewSet):
