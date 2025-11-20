@@ -1,19 +1,24 @@
+import pdb
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+
+# Impor dari Django
+from django.db import transaction, models
+from django.db.models import Q, F, Sum, Subquery, OuterRef, DecimalField, Value, Case, When
+from django.db.models.functions import Coalesce
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+
+# Impor dari Django REST Framework
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.permissions import AllowAny
-from accounts.permissions import IsAdminOrSales
-from django.db.models import Q, F, Sum, Subquery, OuterRef, DecimalField, Value, Case, When
-from django.db.models.functions import Coalesce
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django_filters.rest_framework import DjangoFilterBackend
-from accounts.permissions import IsAdminOrWarehouse
-from django.db import transaction, models
-from django.shortcuts import get_object_or_404
-from django.utils import timezone
-from purchasing.models import PurchaseOrder, PurchaseOrderItem
-from decimal import Decimal, InvalidOperation
-from datetime import datetime, timedelta
+
+# Impor dari aplikasi Anda sendiri
+from accounts.permissions import IsAdminOrWarehouse, IsAdminOrSales
+from purchasing.models import PurchaseOrder, PurchaseOrderItem, Bill
 from .models import (
     MainCategory, SubCategory, Category, Location, Product, Stock, 
     BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockMovement, GoodsReceipt, GoodsReceiptItem, StockTransfer, StockTransferItem
@@ -1135,11 +1140,12 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def confirm_receipt(self, request, pk=None):
+        from django.utils import timezone
         goods_receipt = self.get_object()
         
         if goods_receipt.status != 'DRAFT':
             return Response({'error': 'Hanya receipt berstatus DRAFT yang bisa dikonfirmasi'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         # VALIDASI: Pastikan lokasi sudah diisi
         if not goods_receipt.location:
             return Response({'error': 'Lokasi penerimaan harus ditentukan sebelum konfirmasi'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1147,10 +1153,11 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
         try:
             with transaction.atomic():
                 goods_receipt.status = 'CONFIRMED'
+                #goods_receipt.receipt_date = timezone.now().date()
+                goods_receipt.received_by = request.user
                 goods_receipt.save()
                 
                 for item in goods_receipt.items.all():
-                    # **FIX**: Gunakan lokasi dari parent (GoodsReceipt)
                     stock_location = goods_receipt.location
                     
                     stock, created = Stock.objects.get_or_create(
@@ -1209,24 +1216,52 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
                 # Check if purchase order is fully received
                 if goods_receipt.purchase_order:
                     po = goods_receipt.purchase_order
-                    all_items_received = True
-                    for po_item in po.items.all():
-                        total_received = sum(
-                            gr_item.quantity_received 
-                            for gr_item in po_item.goodsreceiptitem_set.all()
-                        )
-                        if total_received < po_item.quantity:
-                            all_items_received = False
-                            break
+                    supplier = po.supplier
                     
-                    if all_items_received:
-                        po.status = 'RECEIVED'
-                        po.save()
-                
-                serializer = GoodsReceiptSerializer(goods_receipt)
-                return Response(serializer.data)
+                    total_bill_amount = sum(
+                        (item.quantity_received * item.unit_price)
+                        for item in goods_receipt.items.all()
+                    )
+                    
+                    # Jangan buat Bill jika totalnya nol
+                    if total_bill_amount > 0:
+                        due_date = timezone.now().date()
+                        payment_terms_str = supplier.payment_terms or "" # Ambil payment_terms, default string kosong
+
+                        try:
+                            # 1. Coba ekstrak angka dari string
+                            # Ini akan mencari semua digit dalam string dan menggabungkannya
+                            numeric_part = ''.join(filter(str.isdigit, payment_terms_str))
+                            
+                            # 2. Jika ada angka yang ditemukan, konversi ke integer
+                            if numeric_part:
+                                days = int(numeric_part)
+                                due_date = timezone.now().date() + timedelta(days=days)
+                                
+                        except (ValueError, TypeError):
+                            # Jika terjadi error saat konversi (seharusnya jarang terjadi),
+                            # biarkan due_date tetap menggunakan nilai default (hari ini).
+                            pass
+
+                        Bill.objects.create(
+                            supplier=supplier, # Gunakan objek supplier yang sudah kita ambil
+                            purchase_order=po,
+                            goods_receipt=goods_receipt,
+                            bill_date=timezone.now().date(),
+                            due_date=due_date,
+                            total_amount=total_bill_amount,
+                            status='PENDING',
+                            notes=f"Auto-generated from Goods Receipt #{goods_receipt.receipt_number}"
+                        )
+
+            serializer = self.get_serializer(goods_receipt)
+            return Response(serializer.data, status=status.HTTP_200_OK)
                 
         except Exception as e:
+            # Tambahkan logging untuk melihat error yang sebenarnya jika ada
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error in confirm_receipt: {e}", exc_info=True)
             return Response(
                 {'error': str(e)}, 
                 status=status.HTTP_400_BAD_REQUEST
