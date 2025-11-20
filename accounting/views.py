@@ -41,9 +41,15 @@ class AccountViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(account_type__category=account_type)
         
         # Filter by active status
-        is_active = self.request.query_params.get('is_active')
-        if is_active is not None:
-            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+        is_active_param = self.request.query_params.get('is_active')
+        if is_active_param is not None:
+            is_active_bool = is_active_param.lower() == 'true'
+            queryset = queryset.filter(is_active=is_active_bool)
+            
+            # Jika pengguna secara spesifik meminta akun yang AKTIF,
+            # tambahkan juga filter untuk allow_manual_entries.
+            if is_active_bool:
+                queryset = queryset.filter(allow_manual_entries=True)
         
         # Search by name or code
         search = self.request.query_params.get('search')
