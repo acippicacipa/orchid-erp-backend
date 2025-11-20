@@ -23,6 +23,7 @@ class DataImportService:
         self.data_import = DataImport.objects.get(id=data_import_id)
         self.template = self.data_import.template
         self.errors = []
+        self.logs = []
     
     def process_file(self):
         """Fungsi utama yang menjalankan validasi dan impor."""
@@ -47,12 +48,23 @@ class DataImportService:
         self.data_import.status = 'VALIDATING'
         self.data_import.started_at = timezone.now()
         self.data_import.save()
+        self._add_log('INFO', f"Starting validation for file: {self.data_import.file.name}")
+
+        converters = {'code': str}
 
         try:
-            df = pd.read_excel(self.data_import.file.path).fillna('')
+            df = pd.read_excel(
+                self.data_import.file.path, 
+                dtype=str, # Tetap gunakan dtype=str sebagai pertahanan utama
+                converters=converters
+            ).fillna('')
         except Exception:
             try:
-                df = pd.read_csv(self.data_import.file.path).fillna('')
+                df = pd.read_csv(
+                    self.data_import.file.path, 
+                    dtype=str, 
+                    converters=converters
+                ).fillna('')
             except Exception as e:
                 self._add_error(0, f"Could not read file. Error: {e}")
                 return False
@@ -63,7 +75,9 @@ class DataImportService:
         required_columns = self.template.required_columns
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
-            self._add_error(0, f"Missing required columns: {', '.join(missing_columns)}")
+            msg = f"Missing required columns: {', '.join(missing_columns)}"
+            self._add_error(0, msg) # Gunakan _add_error yang sudah diperbaiki
+            self._add_log('CRITICAL', msg) # Log sebagai critical
             return False
 
         # Dapatkan fungsi validator berdasarkan template_type
@@ -73,18 +87,26 @@ class DataImportService:
             return False
 
         for index, row in df.iterrows():
+            self._add_log('DEBUG', f"Validating row {index + 2}", row.to_dict())
             if not validator(index + 2, row):
                 self.data_import.failed_rows += 1
         
         self._save_errors()
+        self._save_logs() # Simpan log
         self.data_import.save()
+        
+        if self.data_import.failed_rows > 0:
+            self._add_log('WARNING', f"Validation completed with {self.data_import.failed_rows} errors.")
+        else:
+            self._add_log('INFO', "Validation completed successfully.")
+            
         return self.data_import.failed_rows == 0
 
     def _import_data(self):
         self.data_import.status = 'PROCESSING'
         self.data_import.save()
 
-        df = pd.read_excel(self.data_import.file.path).fillna('')
+        df = pd.read_excel(self.data_import.file.path, dtype=str).fillna('')
         importer = self._get_importer()
 
         for index, row in df.iterrows():
@@ -104,7 +126,15 @@ class DataImportService:
 
     # --- Helper dan Dispatcher ---
     def _add_error(self, row_number, message, raw_data=None):
-        """Menambahkan detail error ke dalam list untuk disimpan nanti."""
+        """Menambahkan error dan juga mencatatnya sebagai log."""
+        error_details = {
+            'row': row_number,
+            'data': raw_data
+        }
+        # Catat sebagai log level ERROR
+        self._add_log('ERROR', message, details=error_details)
+        
+        # Tambahkan ke daftar error untuk disimpan ke ImportErrorLog
         self.errors.append(ImportErrorLog(
             data_import=self.data_import,
             row_number=row_number,
@@ -116,6 +146,12 @@ class DataImportService:
         if self.errors:
             ImportErrorLog.objects.bulk_create(self.errors)
             self.errors = []
+
+    def _save_logs(self):
+        """Menyimpan semua log yang terkumpul."""
+        if self.logs:
+            ImportLog.objects.bulk_create(self.logs)
+            self.logs = []
 
     def _get_validator(self):
         return getattr(self, f"_validate_{self.template.template_type.lower()}_row", None)
@@ -151,20 +187,32 @@ class DataImportService:
     # CUSTOMERS
     def _validate_customers_row(self, row_number, row):
         is_valid = True
-        if not row.get('email'):
-            self._add_error(row_number, "Email is required.", row.to_dict())
-            is_valid = False
-        elif Customer.objects.filter(email=row['email']).exists():
-            self._add_error(row_number, f"Customer with email '{row['email']}' already exists.", row.to_dict())
-            is_valid = False
+        # if not row.get('email'):
+        #     self._add_error(row_number, "Email is required.", row.to_dict())
+        #     is_valid = False
+        # elif Customer.objects.filter(email=row['email']).exists():
+        #     self._add_error(row_number, f"Customer with email '{row['email']}' already exists.", row.to_dict())
+        #     is_valid = False
         return is_valid
 
     def _import_customers_row(self, row_number, row):
-        Customer.objects.create(name=row['name'], email=row['email'], phone=row.get('phone', ''))
+        Customer.objects.create(
+            name=row['name'], 
+            phone=row.get('phone', ''),
+            mobile=row.get('mobile', ''),
+            payment_type=row.get('payment_type'),
+            payment_terms=row.get('payment_terms'),
+            credit_limit=row.get('credit_limit'),
+            address_line_1=row.get('address_line_1'),
+            city=row.get('city'),
+            state=row.get('state'),
+            notes=row.get('notes'),
+            customer_group_id=row.get('customer_group_id')
+        )
         return True
     
     # Supplier validation and import methods
-    def _validate_supplier_row(self, row_number, row):
+    def _validate_suppliers_row(self, row_number, row):
         """Validate supplier data"""
         is_valid = True
         
@@ -172,29 +220,40 @@ class DataImportService:
             self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Supplier name is required')
             is_valid = False
         
-        if pd.isna(row.get('email')) or not str(row.get('email')).strip():
-            self._add_error(row_number, 'email', 'VALIDATION_ERROR', 'Supplier email is required')
-            is_valid = False
-        else:
-            email = str(row.get('email')).strip()
-            if Supplier.objects.filter(email=email).exists():
-                self._add_error(row_number, 'email', 'DUPLICATE_VALUE', f'Supplier with email {email} already exists')
-                is_valid = False
+        # if pd.isna(row.get('email')) or not str(row.get('email')).strip():
+        #     self._add_error(row_number, 'email', 'VALIDATION_ERROR', 'Supplier email is required')
+        #     is_valid = False
+        # else:
+        #     email = str(row.get('email')).strip()
+        #     if Supplier.objects.filter(email=email).exists():
+        #         self._add_error(row_number, 'email', 'DUPLICATE_VALUE', f'Supplier with email {email} already exists')
+        #         is_valid = False
         
         return is_valid
     
-    def _import_supplier_row(self, row_number, row):
+    def _import_suppliers_row(self, row_number, row):
         """Import supplier data"""
         supplier = Supplier.objects.create(
             name=str(row.get('name')).strip(),
-            email=str(row.get('email')).strip(),
+            contact_person=str(row.get('contact_person', '')).strip() or None,
             phone=str(row.get('phone', '')).strip() or None,
-            address=str(row.get('address', '')).strip() or None,
-            city=str(row.get('city', '')).strip() or None,
-            state=str(row.get('state', '')).strip() or None,
-            postal_code=str(row.get('postal_code', '')).strip() or None,
-            country=str(row.get('country', '')).strip() or None,
+            full_address=str(row.get('address', '')).strip() or None, 
+            currency=str(row.get('currency', 'IDR')).strip() or 'IDR',
+            payment_terms=str(row.get('payment_terms', '')).strip() or None,
         )
+
+        # Langkah 2: Setelah objek dibuat, 'supplier.id' sekarang memiliki nilai.
+        # Kita gunakan nilai ini untuk membuat supplier_id yang diformat.
+        # 'S' + padding nol di kiri hingga total 4 digit. Contoh: 45 -> S0045
+        formatted_id = f"S{str(supplier.id).zfill(4)}"
+        
+        # Langkah 3: Tetapkan supplier_id yang baru dibuat ke objek.
+        supplier.supplier_id = formatted_id
+        
+        # Langkah 4: Simpan kembali objek untuk memperbarui field supplier_id di database.
+        # Kita hanya memperbarui field ini untuk efisiensi.
+        supplier.save(update_fields=['supplier_id'])
+
         return True
     
     # Product validation and import methods
@@ -846,46 +905,71 @@ class DataImportService:
         return True
     
     # Account validation and import methods
-    def _validate_account_row(self, row_number, row):
+    def _validate_accounts_row(self, row_number, row):
         """Validate account data"""
         is_valid = True
         
-        # Validate account name
+        #Validate account name
         if pd.isna(row.get('name')) or not str(row.get('name')).strip():
             self._add_error(row_number, 'name', 'VALIDATION_ERROR', 'Account name is required')
             is_valid = False
         
         # Validate account number
-        account_number = row.get('account_number')
+        account_number = row.get('code')
         if pd.isna(account_number) or not str(account_number).strip():
-            self._add_error(row_number, 'account_number', 'VALIDATION_ERROR', 'Account number is required')
+            self._add_error(row_number, 'Account code is required', row.to_dict())
             is_valid = False
         else:
-            if Account.objects.filter(account_number=str(account_number).strip()).exists():
-                self._add_error(row_number, 'account_number', 'DUPLICATE_VALUE', f'Account with number {account_number} already exists')
+            account_code_str = str(account_number).strip()
+            self._add_log('DEBUG', f"Checking for existing account with code: {account_code_str}")
+            if Account.objects.filter(code=account_code_str).exists():
+                self._add_error(row_number, f'Account with code {account_code_str} already exists', row.to_dict())
                 is_valid = False
         
         # Validate account type
-        account_type = row.get('account_type')
-        if pd.isna(account_type) or not str(account_type).strip():
-            self._add_error(row_number, 'account_type', 'VALIDATION_ERROR', 'Account type is required')
+        account_type_name = row.get('account_type_name') # Ganti nama kolom sesuai file Excel Anda
+        if pd.isna(account_type_name) or not str(account_type_name).strip():
+            self._add_error(row_number, 'Account type name is required', row.to_dict())
             is_valid = False
         else:
-            valid_types = ['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE']
-            if str(account_type).strip().upper() not in valid_types:
-                self._add_error(row_number, 'account_type', 'VALIDATION_ERROR', f'Account type must be one of: {", ".join(valid_types)}')
+            from accounting.models import AccountType
+            try:
+                # Coba cari AccountType berdasarkan nama
+                AccountType.objects.get(name__iexact=str(account_type_name).strip())
+                self._add_log('DEBUG', f"Found valid AccountType: {account_type_name}")
+            except AccountType.DoesNotExist:
+                self._add_error(row_number, f'AccountType with name "{account_type_name}" does not exist.', row.to_dict())
                 is_valid = False
+        
+        if not is_valid:
+            self._add_log('WARNING', f"Row {row_number} failed validation.")
         
         return is_valid
     
-    def _import_account_row(self, row_number, row):
+    def _import_accounts_row(self, row_number, row):
         """Import account data"""
+        from accounting.models import AccountType
+        account_type_name = row.get('account_type_name') # Pastikan nama kolom ini sesuai dengan file Excel Anda
+        account_type_obj = AccountType.objects.get(name__iexact=str(account_type_name).strip())
+
+        # Dapatkan objek parent account jika ada
+        parent_account_obj = None
+        parent_code = row.get('parent_account_code') # Asumsi ada kolom 'parent_account_code'
+        if parent_code and not pd.isna(parent_code):
+            try:
+                parent_account_obj = Account.objects.get(code=str(parent_code).strip())
+            except Account.DoesNotExist:
+                # Anda bisa menambahkan error di sini jika parent tidak ditemukan
+                self._add_error(row_number, f"Parent account with code '{parent_code}' not found.", row.to_dict())
+                return False # Hentikan impor baris ini
+
         account = Account.objects.create(
             name=str(row.get('name')).strip(),
-            account_number=str(row.get('account_number')).strip(),
-            account_type=str(row.get('account_type')).strip().upper(),
+            code=str(row.get('code')).strip(),
+            account_type=account_type_obj, # Gunakan objek yang sudah ditemukan
             description=str(row.get('description', '')).strip() or None,
             is_active=bool(row.get('is_active', True)),
+            parent_account=parent_account_obj, # Gunakan objek parent
         )
         return True
     
@@ -937,12 +1021,14 @@ class DataImportService:
         return True
     
     def _add_log(self, level, message, details=None):
-        """Add a log entry"""
-        self.logs.append({
-            'level': level,
-            'message': message,
-            'details': details
-        })
+        """Menambahkan log ke dalam list untuk disimpan nanti."""
+        print(f"LOG [{level}] - {message} - Details: {details}") # Untuk debugging langsung di konsol server
+        self.logs.append(ImportLog(
+            data_import=self.data_import,
+            level=level.upper(), # 'INFO', 'WARNING', 'ERROR'
+            message=message,
+            details=json.dumps(details) if details else None
+        ))
     
     def _save_errors_and_logs(self):
         """Save errors and logs to database"""
