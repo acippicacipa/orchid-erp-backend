@@ -1,13 +1,23 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
 from django.db import models
 from django.db.models import Q
 from accounts.permissions import IsAdminOrPurchasing
-from .models import Supplier, PurchaseOrder, PurchaseOrderItem, Bill, SupplierPayment
-from .serializers import SupplierSerializer, SupplierListSerializer, PurchaseOrderSerializer, PurchaseOrderItemSerializer, BillSerializer, SupplierPaymentSerializer
-from inventory.models import Product
+from .models import (
+    Supplier, PurchaseOrder, PurchaseOrderItem, Bill, SupplierPayment, PurchaseReturn, 
+    ConsignmentReceipt, ConsignmentReceiptItem
+)
+from .serializers import (
+    SupplierSerializer, SupplierListSerializer, PurchaseOrderSerializer, PurchaseOrderItemSerializer, 
+    BillSerializer, SupplierPaymentSerializer, PurchaseReturnSerializer, ConsignmentReceiptSerializer
+)
+from inventory.models import Product, StockMovement, Stock
+from accounting.models import JournalEntry, JournalEntryLine, Account
+from decimal import Decimal
+from django_filters.rest_framework import DjangoFilterBackend
 
 class SupplierViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAdminOrPurchasing]
@@ -233,3 +243,141 @@ class SupplierPaymentViewSet(viewsets.ModelViewSet):
                 bill.status = 'PENDING'
             
             bill.save()
+
+class PurchaseReturnViewSet(viewsets.ModelViewSet):
+    queryset = PurchaseReturn.objects.all().select_related(
+        'supplier', 'bill', 'created_by', 'items_shipped_by', 'return_from_location'
+    ).prefetch_related('items__product').order_by('-return_date')
+    serializer_class = PurchaseReturnSerializer
+    permission_classes = [IsAdminOrPurchasing] # Ganti dengan permission yang sesuai
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['supplier', 'status', 'return_from_location']
+    search_fields = ['return_number', 'supplier__name', 'bill__bill_number']
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        """Menyetujui Purchase Return dan membuat jurnal pembalik utang."""
+        purchase_return = self.get_object()
+        if purchase_return.status != 'DRAFT':
+            return Response({'error': 'Only DRAFT returns can be approved.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --- JURNAL AKUNTANSI 1: PEMBALIK UTANG ---
+        try:
+            ap_account = Account.objects.get(code='2-1100') # Contoh: Akun Utang Usaha
+            # Buat akun kontra-persediaan jika belum ada
+            purchase_return_account, _ = Account.objects.get_or_create(
+                code='1-1399', 
+                defaults={
+                    'name': 'Purchase Returns Clearing', 
+                    'account_type_id': 1, # Asumsi ID 1 adalah Aset
+                    'description': 'Akun sementara untuk retur pembelian'
+                }
+            )
+        except Account.DoesNotExist:
+            return Response({'error': 'Accounting accounts for purchase return are not configured.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        journal = JournalEntry.objects.create(
+            entry_date=timezone.now().date(),
+            entry_type='PURCHASE_RETURN',
+            description=f"Purchase Return {purchase_return.return_number} to {purchase_return.supplier.name}",
+            created_by=request.user
+        )
+        # DEBIT: Utang Usaha
+        JournalEntryLine.objects.create(journal_entry=journal, account=ap_account, debit_amount=purchase_return.total_amount)
+        # KREDIT: Akun Kliring Retur Pembelian
+        JournalEntryLine.objects.create(journal_entry=journal, account=purchase_return_account, credit_amount=purchase_return.total_amount)
+        
+        journal.total_debit = purchase_return.total_amount
+        journal.total_credit = purchase_return.total_amount
+        journal.status = 'POSTED'
+        journal.save()
+        # ------------------------------------------------
+
+        purchase_return.status = 'APPROVED'
+        purchase_return.save()
+        return Response(self.get_serializer(purchase_return).data)
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def ship(self, request, pk=None):
+        """Menyelesaikan retur: mengirim barang, update stok, dan membuat jurnal pengeluaran stok."""
+        purchase_return = self.get_object()
+        if purchase_return.status != 'APPROVED':
+            return Response({'error': 'Only APPROVED returns can be shipped.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --- JURNAL AKUNTANSI 2: PENGELUARAN STOK ---
+        try:
+            inventory_account = Account.objects.get(code='1-1300') # Contoh: Akun Persediaan
+            purchase_return_account = Account.objects.get(code='1-1399') # Akun kliring yang dibuat sebelumnya
+        except Account.DoesNotExist:
+            return Response({'error': 'Accounting accounts for stock reversal are not configured.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        total_cost = Decimal('0.00')
+        for item in purchase_return.items.all():
+            # Buat Stock Movement (kuantitas negatif karena barang keluar)
+            StockMovement.objects.create(
+                product=item.product,
+                location=purchase_return.return_from_location,
+                movement_type='PURCHASE_RETURN',
+                quantity=-item.quantity,
+                unit_cost=item.unit_price, # Gunakan harga beli saat retur
+                reference_number=purchase_return.return_number,
+                user=request.user
+            )
+            total_cost += item.quantity * item.unit_price
+
+        if total_cost > 0:
+            journal = JournalEntry.objects.create(
+                entry_date=timezone.now().date(),
+                entry_type='PURCHASE_RETURN_STOCK',
+                description=f"Stock Reversal for PR {purchase_return.return_number}",
+                created_by=request.user
+            )
+            # DEBIT: Akun Kliring Retur Pembelian
+            JournalEntryLine.objects.create(journal_entry=journal, account=purchase_return_account, debit_amount=total_cost)
+            # KREDIT: Persediaan
+            JournalEntryLine.objects.create(journal_entry=journal, account=inventory_account, credit_amount=total_cost)
+            
+            journal.total_debit = total_cost
+            journal.total_credit = total_cost
+            journal.status = 'POSTED'
+            journal.save()
+        # --------------------------------------------
+
+        purchase_return.status = 'SHIPPED'
+        purchase_return.items_shipped_by = request.user
+        purchase_return.items_shipped_date = timezone.now()
+        purchase_return.save()
+        return Response(self.get_serializer(purchase_return).data)
+
+class ConsignmentReceiptViewSet(viewsets.ModelViewSet):
+    queryset = ConsignmentReceipt.objects.all()
+    serializer_class = ConsignmentReceiptSerializer # Buat serializer ini
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def receive(self, request, pk=None):
+        receipt = self.get_object()
+        if receipt.status != 'DRAFT':
+            return Response({'error': 'Only DRAFT receipts can be processed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Buat Stock Movement dengan status kepemilikan 'CONSIGNED'
+        for item in receipt.items.all():
+            # Ini tidak memicu sinyal post_save, jadi kita update stok secara manual
+            stock, _ = Stock.objects.get_or_create(
+                product=item.product,
+                location=receipt.location,
+                ownership_status='CONSIGNED', # <-- KUNCI UTAMA
+                defaults={'quantity_on_hand': 0}
+            )
+            stock.quantity_on_hand += item.quantity
+            stock.save()
+
+        receipt.status = 'RECEIVED'
+        receipt.save()
+        return Response(self.get_serializer(receipt).data)

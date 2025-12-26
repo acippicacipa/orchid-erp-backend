@@ -157,3 +157,94 @@ class SupplierPayment(BaseModel):
     def __str__(self):
         return f"Payment of {self.amount} for Bill {self.bill.bill_number}"
 
+class PurchaseReturn(BaseModel):
+    """Dokumen utama untuk Retur Pembelian (Debit Note)."""
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('APPROVED', 'Approved'),
+        ('SHIPPED', 'Shipped'), # Setelah barang dikirim kembali
+        ('CANCELLED', 'Cancelled'),
+    ]
+
+    return_number = models.CharField(max_length=50, unique=True, blank=True)
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name='purchase_returns')
+    return_date = models.DateField(default=timezone.now)
+    
+    # Tautkan ke dokumen sumber
+    bill = models.ForeignKey(Bill, on_delete=models.SET_NULL, null=True, blank=True, related_name='returns')
+    goods_receipt = models.ForeignKey('inventory.GoodsReceipt', on_delete=models.SET_NULL, null=True, blank=True, related_name='returns')
+    
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    total_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0.00)
+    reason = models.TextField(blank=True, null=True)
+    
+    # Info pengiriman kembali barang
+    items_shipped_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='shipped_purchase_returns')
+    items_shipped_date = models.DateTimeField(null=True, blank=True)
+    # Lokasi asal barang yang diretur
+    return_from_location = models.ForeignKey('inventory.Location', on_delete=models.PROTECT, help_text="Lokasi asal barang retur")
+
+    def save(self, *args, **kwargs):
+        if not self.return_number:
+            prefix = f"PR-{self.return_date.year}-"
+            last_return = PurchaseReturn.objects.filter(return_number__startswith=prefix).order_by('return_number').last()
+            if last_return:
+                last_num = int(last_return.return_number.split('-')[-1])
+                new_num = last_num + 1
+            else:
+                new_num = 1
+            self.return_number = f"{prefix}{new_num:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.return_number
+
+class PurchaseReturnItem(BaseModel):
+    """Item-item yang ada di dalam dokumen PurchaseReturn."""
+    purchase_return = models.ForeignKey(PurchaseReturn, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey('inventory.Product', on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    line_total = models.DecimalField(max_digits=15, decimal_places=2)
+
+    def save(self, *args, **kwargs):
+        self.line_total = self.quantity * self.unit_price
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
+class ConsignmentReceipt(BaseModel):
+    """Dokumen untuk mencatat penerimaan barang titipan dari supplier."""
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('RECEIVED', 'Received'),
+    ]
+    receipt_number = models.CharField(max_length=50, unique=True, blank=True)
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name='consignment_receipts')
+    receipt_date = models.DateField(default=timezone.now)
+    location = models.ForeignKey('inventory.Location', on_delete=models.PROTECT)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    notes = models.TextField(blank=True, null=True)
+
+    def save(self, *args, **kwargs):
+        if not self.receipt_number:
+            prefix = f"CRCV-{self.receipt_date.year}-"
+            last_receipt = ConsignmentReceipt.objects.filter(receipt_number__startswith=prefix).order_by('receipt_number').last()
+            last_num = int(last_receipt.receipt_number.split('-')[-1]) if last_receipt else 0
+            self.receipt_number = f"{prefix}{last_num + 1:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.receipt_number
+
+class ConsignmentReceiptItem(BaseModel):
+    """Item-item dalam penerimaan konsinyasi."""
+    receipt = models.ForeignKey(ConsignmentReceipt, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey('inventory.Product', on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, help_text="Harga beli jika barang ini dikonsumsi/dibeli")
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
