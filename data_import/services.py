@@ -10,6 +10,7 @@ from inventory.models import Product, Stock, Location, MainCategory, SubCategory
 from sales.models import Customer, SalesOrder, SalesOrderItem, Invoice, Payment
 from purchasing.models import Supplier, PurchaseOrder, PurchaseOrderItem, Bill, SupplierPayment
 from accounting.models import Account, JournalEntry, JournalItem, Ledger
+from decimal import Decimal
 import logging
 
 logger = logging.getLogger(__name__)
@@ -571,7 +572,17 @@ class DataImportService:
     def _import_inventory_row(self, row_number, row):
         product = Product.objects.get(sku=row['product_sku'])
         location = Location.objects.get(code=row['warehouse_code'])
-        quantity = row.get('quantity_on_hand', 0)
+        try:
+            # 1. Ambil nilai sebagai string
+            quantity_str = str(row.get('quantity_on_hand', '0'))
+            
+            # 2. Konversi string ke Decimal secara eksplisit
+            quantity = Decimal(quantity_str)
+
+        except (ValueError, TypeError):
+            # Jika konversi gagal, laporkan error dan lewati baris ini
+            self._add_error(row_number, f"Invalid numeric format for quantity_on_hand: '{row.get('quantity_on_hand')}'", row.to_dict())
+            return False # Mengembalikan False menandakan impor baris ini gagal
 
         unit_cost = product.cost_price or Decimal('0.00')
 
