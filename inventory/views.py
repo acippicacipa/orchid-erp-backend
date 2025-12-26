@@ -37,7 +37,7 @@ from .serializers import (
 class MainCategoryViewSet(viewsets.ModelViewSet):
     queryset = MainCategory.objects.all()
     serializer_class = MainCategorySerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = MainCategory.objects.all()
@@ -51,7 +51,7 @@ class MainCategoryViewSet(viewsets.ModelViewSet):
 class SubCategoryViewSet(viewsets.ModelViewSet):
     queryset = SubCategory.objects.all()
     serializer_class = SubCategorySerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = SubCategory.objects.all()
@@ -65,7 +65,7 @@ class SubCategoryViewSet(viewsets.ModelViewSet):
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = Category.objects.select_related('main_category', 'sub_category').all()
@@ -92,7 +92,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
     serializer_class = LocationSerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = Location.objects.all()
@@ -118,7 +118,7 @@ class LocationViewSet(viewsets.ModelViewSet):
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = Product.objects.select_related('main_category', 'sub_category').all()
@@ -502,7 +502,7 @@ class BOMItemViewSet(viewsets.ModelViewSet):
 class AssemblyOrderViewSet(viewsets.ModelViewSet):
     queryset = AssemblyOrder.objects.all()
     serializer_class = AssemblyOrderSerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = AssemblyOrder.objects.select_related('bom__product').prefetch_related('items__component').all()
@@ -856,7 +856,7 @@ class AssemblyOrderViewSet(viewsets.ModelViewSet):
 class AssemblyOrderItemViewSet(viewsets.ModelViewSet):
     queryset = AssemblyOrderItem.objects.all()
     serializer_class = AssemblyOrderItemSerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     def get_queryset(self):
         queryset = AssemblyOrderItem.objects.select_related('assembly_order', 'component').all()
@@ -873,7 +873,7 @@ class StockMovementViewSet(viewsets.ModelViewSet):
     """
     queryset = StockMovement.objects.all()
     serializer_class = StockMovementSerializer
-    permission_classes = [IsAdminOrWarehouse] # Sesuaikan dengan izin yang Anda inginkan
+    permission_classes = [AllowAny] # Sesuaikan dengan izin yang Anda inginkan
     filter_backends = [filters.SearchFilter, DjangoFilterBackend] # DjangoFilterBackend jika Anda juga filter by field
     search_fields = ['reference_number', 'product__name', 'product__sku']
     filterset_fields = ['movement_type', 'location', 'product']
@@ -1577,7 +1577,7 @@ class ProductSearchViewSet(viewsets.ReadOnlyModelViewSet):
     """
     queryset = Product.objects.filter(is_active=True)
     serializer_class = InventoryProductSearchSerializer
-    permission_classes = [IsAdminOrSales]
+    permission_classes = [AllowAny]
     filter_backends = [filters.SearchFilter]
     search_fields = ['name', 'sku']
 
@@ -1783,7 +1783,7 @@ class StockTransferViewSet(viewsets.ModelViewSet):
 class ProductBundleViewSet(viewsets.ModelViewSet):
     queryset = ProductBundle.objects.all()
     serializer_class = ProductBundleSerializer
-    permission_classes = [IsAdminOrWarehouse]
+    permission_classes = [AllowAny]
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
