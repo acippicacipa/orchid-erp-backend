@@ -1,4 +1,4 @@
-import pdb
+import pandas as pd
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -8,6 +8,7 @@ from django.db.models import Q, F, Sum, Subquery, OuterRef, DecimalField, Value,
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.http import HttpResponse
 
 # Impor dari Django REST Framework
 from rest_framework import viewsets, status, filters
@@ -21,7 +22,8 @@ from accounts.permissions import IsAdminOrWarehouse, IsAdminOrSales
 from purchasing.models import PurchaseOrder, PurchaseOrderItem, Bill
 from .models import (
     MainCategory, SubCategory, Category, Location, Product, Stock, 
-    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockMovement, GoodsReceipt, GoodsReceiptItem, StockTransfer, StockTransferItem
+    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockMovement, GoodsReceipt, GoodsReceiptItem, StockTransfer, StockTransferItem,
+    ProductBundleComponent, ProductBundle
 )
 from .serializers import (
     MainCategorySerializer, SubCategorySerializer, CategorySerializer, 
@@ -29,7 +31,7 @@ from .serializers import (
     BillOfMaterialsSerializer, BOMItemSerializer, 
     AssemblyOrderSerializer, AssemblyOrderItemSerializer, StockMovementSerializer, GoodsReceiptSerializer, CreateGoodsReceiptSerializer, 
     PurchaseOrderForReceiptSerializer, AssemblyOrderForReceiptSerializer, CreateBulkMovementSerializer, InventoryProductSearchSerializer,
-    StockTransferSerializer
+    StockTransferSerializer, ProductBundleSerializer 
 )
 
 class MainCategoryViewSet(viewsets.ModelViewSet):
@@ -397,6 +399,53 @@ class StockViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Stock adjusted successfully.", "movement_id": movement.id}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'], url_path='export-for-opname')
+    def export_for_opname(self, request):
+        """
+        Mengekspor data stok untuk satu lokasi ke dalam file Excel untuk stock opname.
+        Membutuhkan query parameter 'location_id'.
+        """
+        location_id = request.query_params.get('location_id')
+        if not location_id:
+            return Response(
+                {'error': 'Parameter "location_id" is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            location = Location.objects.get(id=location_id)
+        except Location.DoesNotExist:
+            return Response(
+                {'error': f'Location with ID {location_id} not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Ambil semua stok untuk lokasi yang dipilih
+        stocks = Stock.objects.filter(location=location).select_related('product')
+
+        # Siapkan data untuk DataFrame Pandas
+        data = {
+            'product_sku': [stock.product.sku for stock in stocks],
+            'product_name': [stock.product.name for stock in stocks],
+            'system_quantity': [stock.quantity_on_hand for stock in stocks],
+            'physical_quantity': ['' for _ in stocks], # Kolom kosong untuk diisi manual
+            'notes': ['' for _ in stocks], # Kolom opsional untuk catatan
+        }
+
+        df = pd.DataFrame(data)
+
+        # Buat respons HTTP dengan file Excel
+        response = HttpResponse(
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        filename = f"stock_opname_{location.code}_{timezone.now().strftime('%Y%m%d')}.xlsx"
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+
+        # Tulis DataFrame ke dalam respons
+        df.to_excel(response, index=False)
+
+        return response
 
 class BillOfMaterialsViewSet(viewsets.ModelViewSet):
     queryset = BillOfMaterials.objects.all()
@@ -946,13 +995,14 @@ class StockMovementViewSet(viewsets.ModelViewSet):
                 created_movements.append(in_movement)
 
             else: # Untuk tipe lain (ADJUSTMENT, DAMAGE, RECEIPT)
-                # Tentukan apakah kuantitas harus positif atau negatif
-                if movement_type in ['DAMAGE', 'SALE']:
-                    # Jika barang rusak atau dijual, kuantitasnya mengurangi stok
-                    final_quantity = -abs(quantity)
-                else:
-                    # Jika adjustment positif atau receipt, kuantitas menambah stok
-                    final_quantity = abs(quantity)
+                final_quantity = quantity # Defaultnya, gunakan nilai dari request
+
+                if movement_type == 'DAMAGE' and final_quantity > 0:
+                    # Jika tipenya DAMAGE, paksa jadi negatif jika belum
+                    final_quantity = -final_quantity
+                elif movement_type == 'RECEIPT' and final_quantity < 0:
+                    # Jika tipenya RECEIPT, paksa jadi positif jika belum
+                    final_quantity = abs(final_quantity)
 
                 movement = StockMovement.objects.create(
                     product=product,
@@ -1023,6 +1073,249 @@ class StockMovementViewSet(viewsets.ModelViewSet):
 
         # Kembalikan hasil dalam format paginasi DRF
         return paginator.get_paginated_response(list(grouped_transfers.values()))
+    
+    @action(detail=False, methods=['post'], url_path='adjust-from-opname')
+    @transaction.atomic
+    def adjust_from_opname(self, request):
+        """
+        Membuat stock adjustment massal dari file Excel hasil stock opname.
+        """
+        file = request.FILES.get('file')
+        location_id = request.data.get('location_id')
+        notes = request.data.get('notes', 'Stock Opname Adjustment')
+
+        if not file or not location_id:
+            return Response(
+                {'error': 'A file and location_id are required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            location = Location.objects.get(id=location_id)
+            df = pd.read_excel(file).fillna('')
+        except Location.DoesNotExist:
+            return Response({'error': 'Location not found.'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({'error': f'Failed to read file: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validasi kolom yang dibutuhkan
+        required_cols = ['product_sku', 'system_quantity', 'physical_quantity']
+        if not all(col in df.columns for col in required_cols):
+            return Response(
+                {'error': f'File must contain columns: {", ".join(required_cols)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        movements_to_create = []
+        errors = []
+
+        for index, row in df.iterrows():
+            sku = row['product_sku']
+            physical_qty_val = row['physical_quantity']
+
+            # Lewati baris jika physical_quantity tidak diisi
+            if physical_qty_val == '':
+                continue
+
+            try:
+                physical_qty = Decimal(physical_qty_val)
+                system_qty = Decimal(row['system_quantity'])
+                product = Product.objects.get(sku=sku)
+
+                # Hitung selisihnya
+                difference = physical_qty - system_qty
+
+                # Hanya buat movement jika ada selisih
+                if difference != 0:
+                    movements_to_create.append(
+                        StockMovement(
+                            product=product,
+                            location=location,
+                            movement_type='ADJUSTMENT',
+                            quantity=difference,
+                            unit_cost=product.cost_price or Decimal('0.00'),
+                            notes=f"{notes} - Opname for {sku}. System: {system_qty}, Physical: {physical_qty}. Notes: {row.get('notes', '')}",
+                            user=request.user
+                        )
+                    )
+            except Product.DoesNotExist:
+                errors.append(f"Row {index + 2}: Product with SKU '{sku}' not found.")
+            except (ValueError, InvalidOperation):
+                errors.append(f"Row {index + 2}: Invalid number format for SKU '{sku}'.")
+
+        if errors:
+            return Response({'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Buat semua movement dalam satu transaksi
+        if movements_to_create:
+            StockMovement.objects.bulk_create(movements_to_create)
+            # Sinyal post_save tidak terpicu oleh bulk_create, jadi kita perlu update stok manual
+            for movement in movements_to_create:
+                stock, _ = Stock.objects.get_or_create(product=movement.product, location=movement.location)
+                stock.quantity_on_hand += movement.quantity
+                stock.quantity_sellable += movement.quantity # Asumsi sellable juga di-adjust
+                stock.save()
+
+        return Response(
+            {'message': f'{len(movements_to_create)} stock adjustments created successfully.'},
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=False, methods=['post'], url_path='import-waste')
+    @transaction.atomic
+    def import_waste(self, request):
+        """
+        Membuat pergerakan stok 'DAMAGE' secara massal dari file Excel.
+        File harus berisi kolom: 'product_sku', 'quantity', 'location_code'.
+        """
+        file = request.FILES.get('file')
+        notes = request.data.get('notes', 'Waste/Damage Report')
+
+        if not file:
+            return Response(
+                {'error': 'An Excel file is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            # Gunakan 'converters' untuk memastikan semua data dibaca sebagai string
+            df = pd.read_excel(file, converters={
+                'product_sku': str,
+                'quantity': str,
+                'location_code': str
+            })
+            df.fillna('', inplace=True)
+        except Exception as e:
+            return Response({'error': f'Failed to read file: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validasi kolom yang dibutuhkan
+        required_cols = ['product_sku', 'quantity', 'location_code']
+        if not all(col in df.columns for col in required_cols):
+            return Response(
+                {'error': f'File must contain columns: {", ".join(required_cols)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        movements_to_create = []
+        errors = []
+
+        for index, row in df.iterrows():
+            sku = row['product_sku']
+            quantity_str = row['quantity']
+            location_code = row['location_code']
+
+            # Lewati baris jika data penting tidak diisi
+            if not all([sku, quantity_str, location_code]):
+                continue
+
+            try:
+                # Konversi kuantitas ke Decimal, pastikan selalu positif dari file
+                quantity = abs(Decimal(quantity_str))
+                product = Product.objects.get(sku=sku)
+                location = Location.objects.get(code=location_code)
+
+                # Buat movement dengan kuantitas NEGATIF karena ini adalah barang keluar/rusak
+                movements_to_create.append(
+                    StockMovement(
+                        product=product,
+                        location=location,
+                        movement_type='DAMAGE',
+                        quantity=-quantity, # Kuantitas selalu negatif untuk DAMAGE
+                        unit_cost=product.cost_price or Decimal('0.00'),
+                        notes=f"{notes} - SKU: {sku}. Notes: {row.get('notes', '')}",
+                        user=request.user
+                    )
+                )
+            except Product.DoesNotExist:
+                errors.append(f"Row {index + 2}: Product with SKU '{sku}' not found.")
+            except Location.DoesNotExist:
+                errors.append(f"Row {index + 2}: Location with code '{location_code}' not found.")
+            except (ValueError, InvalidOperation):
+                errors.append(f"Row {index + 2}: Invalid number format for quantity '{quantity_str}' on SKU '{sku}'.")
+
+        if errors:
+            return Response({'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Buat semua movement dalam satu transaksi
+        if movements_to_create:
+            # Gunakan .save() dalam loop untuk memicu sinyal post_save
+            for movement in movements_to_create:
+                movement.save()
+
+        return Response(
+            {'message': f'{len(movements_to_create)} waste/damage records created successfully.'},
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=False, methods=['post'], url_path='consume-consignment')
+    @transaction.atomic
+    def consume_consignment(self, request):
+        """
+        Mencatat konsumsi barang konsinyasi. Ini akan memicu perubahan kepemilikan,
+        pembuatan utang (Bill), dan jurnal akuntansi.
+        Payload: { "product_id": X, "location_id": Y, "quantity": Z, "supplier_id": S }
+        """
+        product_id = request.data.get('product_id')
+        location_id = request.data.get('location_id')
+        quantity_consumed = Decimal(request.data.get('quantity', 0))
+        supplier_id = request.data.get('supplier_id') # Supplier pemilik barang
+
+        if not all([product_id, location_id, supplier_id]) or quantity_consumed <= 0:
+            return Response({'error': 'Product, location, supplier, and positive quantity are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        product = get_object_or_404(Product, pk=product_id)
+        location = get_object_or_404(Location, pk=location_id)
+        supplier = get_object_or_404(Supplier, pk=supplier_id)
+
+        # 1. Validasi dan kurangi stok konsinyasi
+        consigned_stock = get_object_or_404(Stock, product=product, location=location, ownership_status='CONSIGNED')
+        if consigned_stock.quantity_on_hand < quantity_consumed:
+            return Response({'error': 'Insufficient consigned stock to consume.'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        consigned_stock.quantity_on_hand -= quantity_consumed
+        consigned_stock.save()
+
+        # 2. Tambah stok milik sendiri (OWNED)
+        owned_stock, _ = Stock.objects.get_or_create(
+            product=product, location=location, ownership_status='OWNED',
+            defaults={'quantity_on_hand': 0}
+        )
+        owned_stock.quantity_on_hand += quantity_consumed
+        owned_stock.save()
+
+        # 3. Buat Bill (Tagihan) untuk supplier
+        # Asumsi harga beli diambil dari cost_price produk
+        unit_price = product.cost_price or Decimal('0.00')
+        total_amount = quantity_consumed * unit_price
+        
+        if total_amount > 0:
+            due_date = timezone.now().date() + timedelta(days=30) # Asumsi Net 30
+            Bill.objects.create(
+                supplier=supplier,
+                bill_date=timezone.now().date(),
+                due_date=due_date,
+                total_amount=total_amount,
+                status='PENDING',
+                notes=f"Auto-generated from consumption of {quantity_consumed} x {product.name}"
+            )
+
+        # 4. Buat Jurnal Akuntansi (Pembelian)
+        try:
+            inventory_account = Account.objects.get(code='1-1300') # Persediaan
+            ap_account = Account.objects.get(code='2-1100') # Utang Usaha
+        except Account.DoesNotExist:
+            # Batalkan transaksi jika akun tidak ditemukan
+            raise Exception("Accounting accounts for consignment consumption are not configured.")
+
+        journal = JournalEntry.objects.create(
+            entry_date=timezone.now().date(), entry_type='PURCHASE',
+            description=f"Purchase of consigned stock: {product.name}",
+            created_by=request.user, total_debit=total_amount, total_credit=total_amount, status='POSTED'
+        )
+        JournalEntryLine.objects.create(journal_entry=journal, account=inventory_account, debit_amount=total_amount)
+        JournalEntryLine.objects.create(journal_entry=journal, account=ap_account, credit_amount=total_amount)
+
+        return Response({'message': f'{quantity_consumed} of {product.name} consumed and billed successfully.'}, status=status.HTTP_200_OK)
 
 class GoodsReceiptViewSet(viewsets.ModelViewSet):
     queryset = GoodsReceipt.objects.all().select_related(
@@ -1486,3 +1779,149 @@ class StockTransferViewSet(viewsets.ModelViewSet):
             
         serializer = self.get_serializer(transfer)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+class ProductBundleViewSet(viewsets.ModelViewSet):
+    queryset = ProductBundle.objects.all()
+    serializer_class = ProductBundleSerializer
+    permission_classes = [IsAdminOrWarehouse]
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        """
+        Override metode create untuk menangani pembuatan produk bundle baru
+        DAN transaksi perakitan pertama kalinya.
+        """
+        data = request.data
+        
+        # --- 1. Ambil data untuk produk baru dan komponen ---
+        bundle_type = data.get('bundle_type') # Misal: "Hand Bouquet"
+        form_number = data.get('form_number') # Misal: "20012"
+        new_product_selling_price = Decimal(data.get('new_product_selling_price', '0'))
+        
+        location_id = data.get('location')
+        components_data = data.get('components', [])
+        notes = data.get('notes', '')
+
+        # --- Validasi Input Dasar ---
+        if not all([bundle_type, form_number, location_id]) or not components_data:
+            raise serializers.ValidationError("Bundle type, form number, location, and at least one component are required.")
+
+        # --- 2. Generate Nama dan SKU Otomatis ---
+        current_year = timezone.now().year
+        new_product_name = f"{bundle_type} {current_year} #{form_number}"
+        
+        # Buat SKU: HB-25-20012 (HB dari Hand Bouquet, 25 dari 2025)
+        type_prefix = "".join([word[0] for word in bundle_type.split()]).upper()
+        year_suffix = str(current_year)[-2:]
+        new_product_sku = f"{type_prefix}-{year_suffix}-{form_number}"
+
+        # Cek duplikasi SKU
+        if Product.objects.filter(sku=new_product_sku).exists():
+            raise serializers.ValidationError(f"A product with the generated SKU '{new_product_sku}' already exists. Please use a different Form Number.")
+
+        location = get_object_or_404(Location, pk=location_id)
+        quantity_to_create = Decimal('1.00') # Kuantitas selalu 1
+
+        # --- 3. Validasi Stok & Hitung Total Biaya Komponen ---
+        total_component_cost = Decimal('0.00')
+        for comp_data in components_data:
+            component = get_object_or_404(Product, pk=comp_data['component'])
+            qty_needed = Decimal(comp_data['quantity_used'])
+            
+            stock = Stock.objects.filter(product=component, location=location).first()
+            if not stock or stock.quantity_on_hand < qty_needed:
+                raise serializers.ValidationError(f"Insufficient stock for component: {component.name}")
+            
+            total_component_cost += qty_needed * (stock.average_cost or component.cost_price or Decimal('0.00'))
+
+        # --- 4. Buat Master Produk Bundle Baru ---
+        try:
+            main_cat = MainCategory.objects.get(name__iexact='LOKAL')
+            sub_cat = SubCategory.objects.get(name__iexact='Rangkaian')
+        except (MainCategory.DoesNotExist, SubCategory.DoesNotExist):
+            raise serializers.ValidationError("Main Category 'LOKAL' or Sub Category 'Rangkaian' not found.")
+
+        bundle_product = Product.objects.create(
+            name=new_product_name,
+            sku=new_product_sku,
+            main_category=main_cat,
+            sub_category=sub_cat,
+            cost_price=total_component_cost, # Karena quantity = 1, unit cost = total cost
+            selling_price=new_product_selling_price,
+            is_bundle=True,
+            is_active=True,
+            created_by=request.user
+        )
+
+        # --- 5. Buat Transaksi ProductBundle & Stock Movements ---
+        bundle = ProductBundle.objects.create(
+            product=bundle_product,
+            quantity_created=quantity_to_create,
+            location=location,
+            total_component_cost=total_component_cost,
+            notes=notes,
+            created_by=request.user
+        )
+
+        # --- 5. Buat Stock Movement & Simpan Komponen ---
+        for comp_data in components_data:
+            component = get_object_or_404(Product, pk=comp_data['component'])
+            qty_used = Decimal(comp_data['quantity_used'])
+            stock = Stock.objects.get(product=component, location=location)
+            
+            # Simpan komponen ke record bundle
+            ProductBundleComponent.objects.create(
+                bundle=bundle,
+                component=component,
+                quantity_used=qty_used,
+                unit_cost=stock.average_cost or component.cost_price or Decimal('0.00')
+            )
+            
+            # Buat movement keluar
+            StockMovement.objects.create(
+                product=component, location=location, movement_type='ASSEMBLY',
+                quantity=-qty_used, unit_cost=stock.average_cost,
+                reference_number=bundle.bundle_number, user=request.user
+            )
+        
+        # Buat movement masuk untuk produk bundle
+        StockMovement.objects.create(
+            product=bundle_product, location=location, movement_type='ASSEMBLY',
+            quantity=quantity_to_create, unit_cost=bundle_unit_cost,
+            reference_number=bundle.bundle_number, user=request.user
+        )
+
+        # --- 5. Buat Jurnal Akuntansi ---
+        try:
+            inventory_wip_account = Account.objects.get(code='1-1400') # Persediaan Barang Dalam Proses (WIP)
+            inventory_fg_account = Account.objects.get(code='1-1500') # Persediaan Barang Jadi
+        except Account.DoesNotExist:
+            raise serializers.ValidationError("Accounting accounts for bundling are not configured.")
+
+        journal = JournalEntry.objects.create(
+            entry_date=bundle.bundle_date, entry_type='ASSEMBLY',
+            description=f"Bundling for {bundle.bundle_number}", created_by=request.user,
+            total_debit=total_cost, total_credit=total_cost, status='POSTED'
+        )
+        # Debit: Nilai persediaan barang jadi bertambah
+        JournalEntryLine.objects.create(journal_entry=journal, account=inventory_fg_account, debit_amount=total_cost)
+        # Credit: Nilai persediaan komponen (dianggap WIP) berkurang
+        JournalEntryLine.objects.create(journal_entry=journal, account=inventory_wip_account, credit_amount=total_cost)
+
+        # Update total cost di objek bundle
+        bundle.total_component_cost = total_cost
+        bundle.save()
+
+        response_data = {
+            "id": bundle.id,
+            "bundle_number": bundle.bundle_number,
+            "new_product_created": {
+                "id": bundle_product.id,
+                "name": bundle_product.name,
+                "sku": bundle_product.sku,
+                "selling_price": bundle_product.selling_price,
+                "cost_price": bundle_product.cost_price
+            },
+            "message": "Product bundle created and assembled successfully."
+        }
+        return Response(response_data, status=status.HTTP_201_CREATED)

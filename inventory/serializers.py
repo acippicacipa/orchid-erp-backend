@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from .models import (
     MainCategory, SubCategory, Category, Location, Product, Stock, 
-    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockTransfer, StockTransferItem
+    BillOfMaterials, BOMItem, AssemblyOrder, AssemblyOrderItem, StockTransfer, StockTransferItem,
+    ProductBundleComponent, ProductBundle
 )
 from django.db import models, transaction
 
@@ -549,3 +550,89 @@ class StockTransferSerializer(serializers.ModelSerializer):
                 StockTransferItem.objects.create(stock_transfer=transfer, **item_data)
                 
         return transfer
+
+class ProductBundleComponentSerializer(serializers.ModelSerializer):
+    """
+    Serializer untuk komponen yang digunakan dalam sebuah ProductBundle.
+    Digunakan sebagai nested serializer di dalam ProductBundleSerializer.
+    """
+    # Read-only fields untuk menampilkan informasi di response
+    component_name = serializers.CharField(source='component.name', read_only=True)
+    component_sku = serializers.CharField(source='component.sku', read_only=True)
+
+    class Meta:
+        model = ProductBundleComponent
+        fields = [
+            'id', 
+            'component',      # ID produk komponen untuk write operations
+            'component_name', # Untuk display (read-only)
+            'component_sku',  # Untuk display (read-only)
+            'quantity_used', 
+            'unit_cost'       # Akan diisi oleh sistem, jadi read-only saat create
+        ]
+        read_only_fields = ['unit_cost']
+        # Pastikan 'component' bisa ditulis (writeable) saat membuat
+        extra_kwargs = {
+            'component': {'write_only': False} 
+        }
+
+
+class ProductBundleSerializer(serializers.ModelSerializer):
+    """
+    Serializer utama untuk ProductBundle.
+    Menangani nested creation untuk komponen-komponennya.
+    Logika utama proses bundling terjadi di ViewSet, bukan di sini.
+    Serializer ini lebih fokus pada validasi dan representasi data.
+    """
+    # Nested serializer untuk menerima dan menampilkan komponen
+    components = ProductBundleComponentSerializer(many=True)
+
+    # Read-only fields untuk menampilkan informasi relasi di frontend
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+
+    class Meta:
+        model = ProductBundle
+        fields = [
+            'id', 'bundle_number', 'product', 'product_name', 'quantity_created',
+            'location', 'location_name', 'bundle_date', 'total_component_cost',
+            'notes', 'created_by', 'created_by_name', 'created_at', 'components'
+        ]
+        read_only_fields = [
+            'bundle_number', 
+            'total_component_cost', 
+            'created_by', 
+            'created_by_name',
+            'created_at'
+        ]
+
+    def validate_product(self, value):
+        """Validasi bahwa produk yang dipilih adalah produk bundle."""
+        if not value.is_bundle:
+            raise serializers.ValidationError("The selected product is not marked as a bundle.")
+        return value
+
+    def validate_components(self, value):
+        """Validasi bahwa daftar komponen tidak kosong."""
+        if not value:
+            raise serializers.ValidationError("At least one component is required.")
+        return value
+
+    def create(self, validated_data):
+        """
+        Override metode create.
+        Logika utama (StockMovement, Jurnal) akan ditangani di ViewSet.
+        Di sini kita hanya membuat record ProductBundle dan komponennya.
+        """
+        # Pisahkan data komponen dari data utama
+        components_data = validated_data.pop('components')
+        
+        # Buat objek ProductBundle utama
+        bundle = ProductBundle.objects.create(**validated_data)
+        
+        # Loop melalui data komponen dan buat objek ProductBundleComponent
+        for component_data in components_data:
+            ProductBundleComponent.objects.create(bundle=bundle, **component_data)
+        
+        return bundle

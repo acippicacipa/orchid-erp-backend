@@ -79,6 +79,7 @@ class Location(BaseModel):
         ("TRANSIT", "In Transit"),
         ("SUPPLIER", "Supplier Location"),
         ("CUSTOMER", "Customer Location"),
+        ('CONSIGNMENT', 'Consignment'),
     ]
     
     name = models.CharField(max_length=100, unique=True, db_index=True)
@@ -146,7 +147,8 @@ class Product(BaseModel):
     is_active = models.BooleanField(default=True)
     is_sellable = models.BooleanField(default=True)
     is_purchasable = models.BooleanField(default=True)
-    is_manufactured = models.BooleanField(default=False, help_text="Is this product manufactured/assembled?")
+    is_manufactured = models.BooleanField(default=False)
+    is_bundle = models.BooleanField(default=False, help_text="Is this product a result of bundling/kitting?")
     
     minimum_stock_level = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     maximum_stock_level = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
@@ -189,6 +191,17 @@ class Product(BaseModel):
         return "Uncategorized"
 
 class Stock(BaseModel):
+
+    OWNERSHIP_CHOICES = [
+        ('OWNED', 'Owned'),
+        ('CONSIGNED', 'Consigned'),
+    ]
+    ownership_status = models.CharField(
+        max_length=20, 
+        choices=OWNERSHIP_CHOICES, 
+        default='OWNED'
+    )
+
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="stock_levels")
     location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name="stock_items")
     
@@ -214,11 +227,12 @@ class Stock(BaseModel):
     class Meta:
         verbose_name = "Stock"
         verbose_name_plural = "Stock"
-        unique_together = ("product", "location")
+        unique_together = ('product', 'location', 'ownership_status')
         db_table = "inventory_stock"
 
     def __str__(self):
-        return f"{self.product.name} at {self.location.name}: {self.quantity_on_hand} ({self.quantity_sellable} sellable)"
+        #return f"{self.product.name} at {self.location.name}: {self.quantity_on_hand} ({self.quantity_sellable} sellable)"
+        return f"{self.product.name} at {self.location.name} ({self.ownership_status})"
 
 class BillOfMaterials(BaseModel):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="boms")
@@ -532,6 +546,8 @@ class StockMovement(BaseModel):
         ('TRANSFER_IN', 'Transfer In'),   # Lebih spesifik
         ('RETURN', 'Return'),
         ('DAMAGE', 'Damage/Loss'),
+        ('SALES_RETURN', 'Sales Return'),
+        ('PURCHASE_RETURN', 'Purchase Return'),
     ]
 
     product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='movements')
@@ -553,3 +569,44 @@ class StockMovement(BaseModel):
 
     def __str__(self):
         return f"{self.product.name} - {self.movement_type} - {self.quantity} at {self.location.name}"
+
+class ProductBundle(BaseModel):
+    """Mencatat transaksi perakitan/bundling produk."""
+    bundle_number = models.CharField(max_length=50, unique=True, blank=True)
+    
+    # Produk hasil rakitan
+    product = models.ForeignKey(
+        Product, 
+        on_delete=models.PROTECT, 
+        related_name='bundles_created',
+        limit_choices_to={'is_bundle': True}
+    )
+    quantity_created = models.DecimalField(max_digits=10, decimal_places=2)
+    
+    # Lokasi tempat proses terjadi
+    location = models.ForeignKey(Location, on_delete=models.PROTECT)
+    
+    bundle_date = models.DateField(default=timezone.now)
+    total_component_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0.00)
+    notes = models.TextField(blank=True, null=True)
+
+    def save(self, *args, **kwargs):
+        if not self.bundle_number:
+            prefix = f"BNDL-{self.bundle_date.year}-"
+            last_bundle = ProductBundle.objects.filter(bundle_number__startswith=prefix).order_by('bundle_number').last()
+            last_num = int(last_bundle.bundle_number.split('-')[-1]) if last_bundle else 0
+            self.bundle_number = f"{prefix}{last_num + 1:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.bundle_number
+
+class ProductBundleComponent(BaseModel):
+    """Komponen yang digunakan dalam sebuah transaksi bundling."""
+    bundle = models.ForeignKey(ProductBundle, on_delete=models.CASCADE, related_name='components')
+    component = models.ForeignKey(Product, on_delete=models.PROTECT)
+    quantity_used = models.DecimalField(max_digits=10, decimal_places=2)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, help_text="Cost of the component at the time of bundling")
+
+    def __str__(self):
+        return f"{self.component.name} for {self.bundle.bundle_number}"
