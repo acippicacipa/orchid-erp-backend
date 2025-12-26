@@ -130,8 +130,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         
         if search:
             queryset = queryset.filter(
-                Q(name__icontains=search) | 
-                Q(sku__icontains=search)
+                Q(name__icontains=search) | Q(sku__icontains=search)
             )
         
         if main_category:
@@ -1576,8 +1575,6 @@ class ProductSearchViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Product.objects.filter(is_active=True)
     serializer_class = InventoryProductSearchSerializer
     permission_classes = [AllowAny]
-    filter_backends = [filters.SearchFilter]
-    search_fields = ['name', 'sku']
 
     def get_queryset(self):
         """
@@ -1616,13 +1613,20 @@ class ProductSearchViewSet(viewsets.ReadOnlyModelViewSet):
         """
         queryset = self.get_queryset()
         
-        # filter_queryset akan otomatis membaca 'search' dari request.query_params
-        filtered_queryset = self.filter_queryset(queryset)
+        search_term = request.query_params.get('search', None)
 
-        paginated_queryset = filtered_queryset[:20]
+        # 3. Terapkan filter manual jika ada search_term
+        if search_term:
+            # Ini adalah logika "exact phrase matching" yang Anda inginkan
+            queryset = queryset.filter(
+                Q(name__icontains=search_term) | Q(sku__icontains=search_term)
+            )
 
+        # Batasi hasil untuk performa (misalnya, 20 hasil teratas)
+        paginated_queryset = queryset.order_by('name')[:20]
+
+        # Serialisasi dan kembalikan data
         serializer = self.get_serializer(paginated_queryset, many=True)
-        
         return Response(serializer.data)
     
     @action(detail=True, methods=['get'], url_path='calculate-price')
