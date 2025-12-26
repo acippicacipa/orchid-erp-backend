@@ -1,7 +1,7 @@
 from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.db import transaction
 from django.db import models
 from django.db.models import Q
@@ -20,7 +20,7 @@ from decimal import Decimal
 from django_filters.rest_framework import DjangoFilterBackend
 
 class SupplierViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
     queryset = Supplier.objects.all()
     
     def get_serializer_class(self):
