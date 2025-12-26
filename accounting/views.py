@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -8,10 +8,12 @@ from django.utils import timezone
 from datetime import datetime, date
 from decimal import Decimal
 
+from django_filters.rest_framework import DjangoFilterBackend
+
 from .models import (
     AccountType, Account, JournalEntry, JournalEntryLine,
     FiscalYear, AccountingPeriod, TaxRate, BankAccount,
-    JournalItem, Ledger
+    JournalItem, Ledger, Asset, AssetCategory, AssetMaintenance
 )
 from .serializers import (
     AccountTypeSerializer, AccountSerializer, JournalEntrySerializer,
@@ -19,7 +21,7 @@ from .serializers import (
     FiscalYearSerializer, AccountingPeriodSerializer, TaxRateSerializer,
     BankAccountSerializer, TrialBalanceSerializer, GeneralLedgerSerializer,
     IncomeStatementSerializer, BalanceSheetSerializer, JournalItemSerializer,
-    LedgerSerializer, LegacyJournalEntrySerializer
+    LedgerSerializer, LegacyJournalEntrySerializer, AssetSerializer, AssetCategorySerializer, AssetMaintenanceSerializer
 )
 
 class AccountTypeViewSet(viewsets.ModelViewSet):
@@ -584,4 +586,34 @@ class LedgerViewSet(viewsets.ModelViewSet):
     serializer_class = LedgerSerializer
     permission_classes = [IsAuthenticated]
 
+class AssetCategoryViewSet(viewsets.ModelViewSet):
+    queryset = AssetCategory.objects.all()
+    serializer_class = AssetCategorySerializer
+    permission_classes = [IsAuthenticated] # Ganti dengan permission yang sesuai
 
+class AssetViewSet(viewsets.ModelViewSet):
+    queryset = Asset.objects.select_related('category', 'location').prefetch_related('depreciations').all()
+    serializer_class = AssetSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['category', 'location', 'status']
+    search_fields = ['asset_code', 'name']
+
+    # Anda bisa menambahkan custom action di sini nanti,
+    # misalnya untuk melihat riwayat pemeliharaan atau penyusutan.
+    @action(detail=True, methods=['get'])
+    def history(self, request, pk=None):
+        asset = self.get_object()
+        maintenances = asset.maintenances.all().order_by('-maintenance_date')
+        depreciations = asset.depreciations.all().order_by('-period_date')
+        
+        return Response({
+            'maintenances': AssetMaintenanceSerializer(maintenances, many=True).data,
+            'depreciations': AssetDepreciationSerializer(depreciations, many=True).data,
+        })
+
+class AssetMaintenanceViewSet(viewsets.ModelViewSet):
+    queryset = AssetMaintenance.objects.all()
+    serializer_class = AssetMaintenanceSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ['asset']

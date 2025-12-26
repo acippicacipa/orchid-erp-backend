@@ -1,9 +1,11 @@
+from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     AccountTypeViewSet, AccountViewSet, JournalEntryViewSet, 
     FiscalYearViewSet, AccountingPeriodViewSet, TaxRateViewSet,
     BankAccountViewSet, FinancialReportsViewSet,
-    LegacyJournalEntryViewSet, JournalItemViewSet, LedgerViewSet
+    LegacyJournalEntryViewSet, JournalItemViewSet, LedgerViewSet,
+    AssetViewSet, AssetCategoryViewSet, AssetMaintenanceViewSet
 )
 
 router = DefaultRouter()
@@ -20,6 +22,10 @@ router.register(r'financial-reports', FinancialReportsViewSet, basename='financi
 router.register(r'legacy-journal-entries', LegacyJournalEntryViewSet, basename='legacy-journal-entry')
 router.register(r'journal-items', JournalItemViewSet, basename='journal-item')
 router.register(r'ledgers', LedgerViewSet, basename='ledger')
+
+router.register(r'assets', AssetViewSet)
+router.register(r'asset-categories', AssetCategoryViewSet)
+router.register(r'asset-maintenances', AssetMaintenanceViewSet)
 
 urlpatterns = router.urls
 

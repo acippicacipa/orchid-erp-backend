@@ -4,6 +4,7 @@ from django.utils import timezone
 from decimal import Decimal
 from common.models import BaseModel
 from django.conf import settings
+from inventory.models import Location
 
 class AccountType(models.Model):
     """
@@ -389,4 +390,92 @@ class Ledger(BaseModel):
 
     def __str__(self):
         return f"Ledger for {self.account.name} on {self.date}"
+
+class AssetCategory(BaseModel):
+    """Kategori Aset, misal: Kendaraan, Elektronik, Mesin, Properti."""
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True, null=True)
+    
+    # Akun terkait untuk jurnal otomatis
+    asset_account = models.ForeignKey(Account, related_name='asset_categories', on_delete=models.PROTECT, help_text="Akun Aset Tetap di neraca (e.g., '1-2100 Kendaraan')")
+    accumulated_depreciation_account = models.ForeignKey(Account, related_name='asset_cat_acc_dep', on_delete=models.PROTECT, help_text="Akun Akumulasi Penyusutan (e.g., '1-2101 Akum. Peny. Kendaraan')")
+    depreciation_expense_account = models.ForeignKey(Account, related_name='asset_cat_dep_exp', on_delete=models.PROTECT, help_text="Akun Beban Penyusutan di laba rugi (e.g., '6-1500 Beban Peny. Kendaraan')")
+
+    class Meta:
+        verbose_name = "Asset Category"
+        verbose_name_plural = "Asset Categories"
+        db_table = "accounting_asset_categories" # Beri nama tabel yang jelas
+
+    def __str__(self):
+        return self.name
+
+class Asset(BaseModel):
+    """Model utama untuk Aset Tetap."""
+    STATUS_CHOICES = [
+        ('IN_USE', 'In Use'),
+        ('IN_REPAIR', 'In Repair'),
+        ('IDLE', 'Idle'),
+        ('DISPOSED', 'Disposed'),
+    ]
+    
+    asset_code = models.CharField(max_length=50, unique=True, blank=True)
+    name = models.CharField(max_length=255)
+    category = models.ForeignKey(AssetCategory, on_delete=models.PROTECT, related_name="assets")
+    location = models.ForeignKey(Location, on_delete=models.SET_NULL, null=True, blank=True, related_name="assets")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IN_USE')
+
+    # Info Perolehan
+    purchase_date = models.DateField()
+    purchase_price = models.DecimalField(max_digits=15, decimal_places=2)
+    
+    # Info Penyusutan
+    depreciation_method = models.CharField(max_length=20, default='STRAIGHT_LINE')
+    useful_life_months = models.PositiveIntegerField(help_text="Masa manfaat dalam bulan")
+    salvage_value = models.DecimalField(max_digits=15, decimal_places=2, default=0.00, help_text="Nilai sisa di akhir masa manfaat")
+    
+    # Info Pelepasan
+    disposal_date = models.DateField(null=True, blank=True)
+    disposal_price = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Asset"
+        verbose_name_plural = "Assets"
+        db_table = "accounting_assets"
+
+    def __str__(self):
+        return f"{self.asset_code} - {self.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.asset_code:
+            prefix = f"ASSET-{self.purchase_date.year}-"
+            last_asset = Asset.objects.filter(asset_code__startswith=prefix).order_by('asset_code').last()
+            if last_asset:
+                last_num = int(last_asset.asset_code.split('-')[-1])
+                new_num = last_num + 1
+            else:
+                new_num = 1
+            self.asset_code = f"{prefix}{new_num:04d}"
+        super().save(*args, **kwargs)
+
+class AssetDepreciation(BaseModel):
+    """Mencatat setiap penyusutan yang terjadi per aset per periode."""
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='depreciations')
+    period_date = models.DateField(help_text="Tanggal akhir periode penyusutan (e.g., akhir bulan)")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    journal_entry = models.OneToOneField(JournalEntry, on_delete=models.SET_NULL, null=True, blank=True, related_name="asset_depreciation")
+
+    class Meta:
+        unique_together = ('asset', 'period_date')
+        db_table = "accounting_asset_depreciations"
+
+class AssetMaintenance(BaseModel):
+    """Mencatat riwayat pemeliharaan aset."""
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='maintenances')
+    maintenance_date = models.DateField()
+    description = models.TextField()
+    cost = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    performed_by = models.CharField(max_length=100, blank=True)
+
+    class Meta:
+        db_table = "accounting_asset_maintenances"
 

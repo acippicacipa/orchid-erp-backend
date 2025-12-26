@@ -1,8 +1,9 @@
 from rest_framework import serializers
+from inventory.serializers import LocationSerializer
 from .models import (
     AccountType, Account, JournalEntry, JournalEntryLine, 
     FiscalYear, AccountingPeriod, TaxRate, BankAccount,
-    JournalItem, Ledger
+    JournalItem, Ledger, Asset, AssetCategory, AssetDepreciation, AssetMaintenance
 )
 
 class AccountTypeSerializer(serializers.ModelSerializer):
@@ -233,5 +234,50 @@ class BalanceSheetSerializer(serializers.Serializer):
     total_liabilities = serializers.DecimalField(max_digits=15, decimal_places=2)
     total_equity = serializers.DecimalField(max_digits=15, decimal_places=2)
     as_of_date = serializers.DateField()
+
+class AssetCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssetCategory
+        fields = '__all__'
+
+class AssetMaintenanceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssetMaintenance
+        fields = '__all__'
+
+class AssetDepreciationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssetDepreciation
+        fields = '__all__'
+
+class AssetSerializer(serializers.ModelSerializer):
+    # Tampilkan nama, bukan hanya ID
+    category_name = serializers.CharField(source='category.name', read_only=True)
+    location_name = serializers.CharField(source='location.name', read_only=True)
+    
+    # Kalkulasi field secara on-the-fly
+    book_value = serializers.SerializerMethodField()
+    total_depreciation = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Asset
+        fields = [
+            'id', 'asset_code', 'name', 'category', 'category_name', 'location', 
+            'location_name', 'status', 'purchase_date', 'purchase_price', 
+            'depreciation_method', 'useful_life_months', 'salvage_value',
+            'disposal_date', 'disposal_price', 'book_value', 'total_depreciation',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['asset_code', 'book_value', 'total_depreciation']
+
+    def get_total_depreciation(self, obj):
+        # Menghitung total penyusutan yang sudah tercatat
+        total = obj.depreciations.aggregate(total=models.Sum('amount'))['total']
+        return total or 0
+
+    def get_book_value(self, obj):
+        # Nilai buku = Harga Perolehan - Total Akumulasi Penyusutan
+        total_depreciation = self.get_total_depreciation(obj)
+        return obj.purchase_price - total_depreciation
 
 
