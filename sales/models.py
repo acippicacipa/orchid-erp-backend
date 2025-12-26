@@ -651,3 +651,154 @@ class DeliveryOrder(BaseModel):
 
     def __str__(self):
         return f"{self.do_number} for {self.sales_order.order_number}"
+
+class SalesReturn(BaseModel):
+    """Dokumen utama untuk Retur Penjualan (Credit Note)."""
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('APPROVED', 'Approved'),
+        ('COMPLETED', 'Completed'), # Setelah barang diterima kembali
+        ('CANCELLED', 'Cancelled'),
+    ]
+
+    return_number = models.CharField(max_length=50, unique=True, blank=True)
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name='sales_returns')
+    return_date = models.DateField(default=timezone.now)
+    
+    # Tautkan ke dokumen sumber
+    invoice = models.ForeignKey(Invoice, on_delete=models.SET_NULL, null=True, blank=True, related_name='returns')
+    sales_order = models.ForeignKey(SalesOrder, on_delete=models.SET_NULL, null=True, blank=True, related_name='returns')
+    
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    total_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0.00)
+    reason = models.TextField(blank=True, null=True)
+    
+    # Info penerimaan kembali barang
+    items_received_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='received_sales_returns')
+    items_received_date = models.DateTimeField(null=True, blank=True)
+    return_location = models.ForeignKey('inventory.Location', on_delete=models.PROTECT, help_text="Lokasi tujuan barang retur")
+
+    def save(self, *args, **kwargs):
+        if not self.return_number:
+            prefix = f"SR-{self.return_date.year}-"
+            last_return = SalesReturn.objects.filter(return_number__startswith=prefix).order_by('return_number').last()
+            if last_return:
+                last_num = int(last_return.return_number.split('-')[-1])
+                new_num = last_num + 1
+            else:
+                new_num = 1
+            self.return_number = f"{prefix}{new_num:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.return_number
+
+class SalesReturnItem(BaseModel):
+    """Item-item yang ada di dalam dokumen SalesReturn."""
+    sales_return = models.ForeignKey(SalesReturn, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey('inventory.Product', on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    line_total = models.DecimalField(max_digits=15, decimal_places=2)
+
+    def save(self, *args, **kwargs):
+        self.line_total = self.quantity * self.unit_price
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
+class ConsignmentShipment(BaseModel):
+    """
+    Dokumen untuk mencatat pengiriman barang titipan ke consignee (pelanggan).
+    Ini pada dasarnya adalah Stock Transfer ke lokasi konsinyasi.
+    """
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('SHIPPED', 'Shipped'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+    shipment_number = models.CharField(max_length=50, unique=True, blank=True)
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name='consignment_shipments')
+    shipment_date = models.DateField(default=timezone.now)
+    
+    from_location = models.ForeignKey('inventory.Location', on_delete=models.PROTECT, related_name='consignment_shipments_out')
+    # Lokasi tujuan HARUS merupakan lokasi bertipe CONSIGNMENT
+    to_consignment_location = models.ForeignKey(
+        'inventory.Location', 
+        on_delete=models.PROTECT, 
+        related_name='consignment_shipments_in',
+        limit_choices_to={'location_type': 'CONSIGNMENT'}
+    )
+    
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    notes = models.TextField(blank=True, null=True)
+
+    def save(self, *args, **kwargs):
+        if not self.shipment_number:
+            prefix = f"CS-{self.shipment_date.year}-"
+            # Logika pembuatan nomor otomatis
+            last_shipment = ConsignmentShipment.objects.filter(shipment_number__startswith=prefix).order_by('shipment_number').last()
+            last_num = int(last_shipment.shipment_number.split('-')[-1]) if last_shipment else 0
+            self.shipment_number = f"{prefix}{last_num + 1:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.shipment_number
+
+class ConsignmentShipmentItem(BaseModel):
+    """Item-item dalam pengiriman konsinyasi."""
+    shipment = models.ForeignKey(ConsignmentShipment, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey('inventory.Product', on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2)
+
+    def __str__(self):
+        return f"{self.product.name} x {self.quantity}"
+
+class ConsignmentSalesReport(BaseModel):
+    """
+    Dokumen untuk mencatat laporan penjualan dari consignee.
+    Ini adalah pemicu untuk pengakuan pendapatan dan HPP.
+    """
+    STATUS_CHOICES = [
+        ('DRAFT', 'Draft'),
+        ('CONFIRMED', 'Confirmed'),
+    ]
+    report_number = models.CharField(max_length=50, unique=True, blank=True)
+    customer = models.ForeignKey(Customer, on_delete=models.PROTECT, related_name='consignment_reports')
+    report_date = models.DateField(help_text="Tanggal akhir periode laporan")
+    
+    # Lokasi konsinyasi tempat penjualan terjadi
+    consignment_location = models.ForeignKey(
+        'inventory.Location', 
+        on_delete=models.PROTECT,
+        limit_choices_to={'location_type': 'CONSIGNMENT'}
+    )
+    
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    total_sales_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0.00)
+    total_cogs_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0.00)
+    notes = models.TextField(blank=True, null=True)
+
+    def save(self, *args, **kwargs):
+        if not self.report_number:
+            prefix = f"CSR-{self.report_date.year}-"
+            last_report = ConsignmentSalesReport.objects.filter(report_number__startswith=prefix).order_by('report_number').last()
+            last_num = int(last_report.report_number.split('-')[-1]) if last_report else 0
+            self.report_number = f"{prefix}{last_num + 1:05d}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.report_number
+
+class ConsignmentSalesReportItem(BaseModel):
+    """Item-item yang terjual dalam laporan penjualan konsinyasi."""
+    report = models.ForeignKey(ConsignmentSalesReport, on_delete=models.CASCADE, related_name='items')
+    product = models.ForeignKey('inventory.Product', on_delete=models.PROTECT)
+    quantity_sold = models.DecimalField(max_digits=10, decimal_places=2)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, help_text="Harga jual ke pelanggan akhir")
+    line_total = models.DecimalField(max_digits=15, decimal_places=2)
+
+    def save(self, *args, **kwargs):
+        self.line_total = self.quantity_sold * self.unit_price
+        super().save(*args, **kwargs)

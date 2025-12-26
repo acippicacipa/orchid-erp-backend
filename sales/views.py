@@ -8,20 +8,25 @@ from django.db import transaction
 from django.utils import timezone
 from datetime import datetime, timedelta
 from accounts.permissions import IsAdminOrSales
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from inventory.models import Stock, Location, StockMovement
 from .filters import SalesOrderFilter
 from .services import PricingService
-from .models import Customer, CustomerGroup, Product, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage, DeliveryOrder
+from .models import ( 
+    Customer, CustomerGroup, Product, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, 
+    DownPaymentUsage, DeliveryOrder, SalesReturn, 
+    ConsignmentShipment, ConsignmentShipmentItem, ConsignmentSalesReport, ConsignmentSalesReportItem
+)
 from .serializers import (
     CustomerSerializer, CustomerListSerializer, CustomerGroupSerializer,
     SalesOrderSerializer, SalesOrderListSerializer, SalesOrderItemSerializer,
     InvoiceSerializer, InvoiceListSerializer, PaymentSerializer,
     ProductSearchSerializer, DownPaymentSerializer, DownPaymentUsageSerializer,
-    CustomerDownPaymentSummarySerializer, DeliveryOrderSerializer, CreateConsolidatedInvoiceSerializer, InvoicePrintItemSerializer
+    CustomerDownPaymentSummarySerializer, DeliveryOrderSerializer, CreateConsolidatedInvoiceSerializer, InvoicePrintItemSerializer,
+    SalesReturnSerializer, ConsignmentShipmentSerializer, ConsignmentSalesReportSerializer
 )
-
-from inventory.models import Product
+from accounting.models import JournalEntry, JournalEntryLine, Account
+from inventory.models import StockMovement, Location, Product, Stock
 from decimal import Decimal, InvalidOperation
 from collections import defaultdict
 
@@ -107,7 +112,7 @@ class CustomerViewSet(viewsets.ModelViewSet):
     def search(self, request):
         """Search customers for dropdown selection"""
         query = request.query_params.get('q', '')
-        if len(query) < 2:
+        if len(query) < 3:
             return Response([])
         
         customers = Customer.objects.filter(
@@ -980,3 +985,194 @@ class DownPaymentUsageViewSet(viewsets.ModelViewSet):
         usages = self.get_queryset().filter(down_payment__customer_id=customer_id)
         serializer = self.get_serializer(usages, many=True)
         return Response(serializer.data)
+
+class SalesReturnViewSet(viewsets.ModelViewSet):
+    queryset = SalesReturn.objects.all().select_related(
+        'customer', 'invoice', 'created_by', 'items_received_by', 'return_location'
+    ).prefetch_related('items__product').order_by('-return_date')
+    serializer_class = SalesReturnSerializer
+    permission_classes = [IsAuthenticated] # Ganti dengan permission yang sesuai
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['customer', 'status', 'return_location']
+    search_fields = ['return_number', 'customer__name', 'invoice__invoice_number']
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        """Menyetujui Sales Return dan membuat jurnal pembalik pendapatan."""
+        sales_return = self.get_object()
+        if sales_return.status != 'DRAFT':
+            return Response({'error': 'Only DRAFT returns can be approved.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --- JURNAL AKUNTANSI 1: PEMBALIK PENDAPATAN ---
+        try:
+            # Ambil akun-akun yang relevan dari settings atau model lain
+            sales_return_account = Account.objects.get(code='4-2000') # Contoh: Akun Retur Penjualan
+            ar_account = Account.objects.get(code='1-1200') # Contoh: Akun Piutang Usaha
+        except Account.DoesNotExist:
+            return Response({'error': 'Accounting accounts for sales return are not configured.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        journal = JournalEntry.objects.create(
+            entry_date=timezone.now().date(),
+            entry_type='SALES_RETURN',
+            description=f"Sales Return {sales_return.return_number} from {sales_return.customer.name}",
+            created_by=request.user
+        )
+        # DEBIT: Retur Penjualan
+        JournalEntryLine.objects.create(journal_entry=journal, account=sales_return_account, debit_amount=sales_return.total_amount)
+        # KREDIT: Piutang Usaha
+        JournalEntryLine.objects.create(journal_entry=journal, account=ar_account, credit_amount=sales_return.total_amount)
+        
+        journal.total_debit = sales_return.total_amount
+        journal.total_credit = sales_return.total_amount
+        journal.status = 'POSTED'
+        journal.save()
+        # ------------------------------------------------
+
+        sales_return.status = 'APPROVED'
+        sales_return.save()
+        return Response(self.get_serializer(sales_return).data)
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def complete(self, request, pk=None):
+        """Menyelesaikan retur: menerima barang, update stok, dan membuat jurnal pembalik HPP."""
+        sales_return = self.get_object()
+        if sales_return.status != 'APPROVED':
+            return Response({'error': 'Only APPROVED returns can be completed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --- JURNAL AKUNTANSI 2: PEMBALIK HPP ---
+        try:
+            cogs_account = Account.objects.get(code='5-1000') # Contoh: Akun HPP
+            inventory_account = Account.objects.get(code='1-1300') # Contoh: Akun Persediaan
+        except Account.DoesNotExist:
+            return Response({'error': 'Accounting accounts for COGS reversal are not configured.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        total_cost = Decimal('0.00')
+        for item in sales_return.items.all():
+            # Buat Stock Movement
+            StockMovement.objects.create(
+                product=item.product,
+                location=sales_return.return_location,
+                movement_type='SALES_RETURN',
+                quantity=item.quantity, # Kuantitas positif karena barang masuk kembali
+                unit_cost=item.product.cost_price or 0,
+                reference_number=sales_return.return_number,
+                user=request.user
+            )
+            total_cost += item.quantity * (item.product.cost_price or 0)
+
+        if total_cost > 0:
+            journal = JournalEntry.objects.create(
+                entry_date=timezone.now().date(),
+                entry_type='SALES_RETURN_COGS',
+                description=f"COGS Reversal for SR {sales_return.return_number}",
+                created_by=request.user
+            )
+            # DEBIT: Persediaan
+            JournalEntryLine.objects.create(journal_entry=journal, account=inventory_account, debit_amount=total_cost)
+            # KREDIT: HPP
+            JournalEntryLine.objects.create(journal_entry=journal, account=cogs_account, credit_amount=total_cost)
+            
+            journal.total_debit = total_cost
+            journal.total_credit = total_cost
+            journal.status = 'POSTED'
+            journal.save()
+        # --------------------------------------------
+
+        sales_return.status = 'COMPLETED'
+        sales_return.items_received_by = request.user
+        sales_return.items_received_date = timezone.now()
+        sales_return.save()
+        return Response(self.get_serializer(sales_return).data)
+
+class ConsignmentShipmentViewSet(viewsets.ModelViewSet):
+    queryset = ConsignmentShipment.objects.all()
+    serializer_class = ConsignmentShipmentSerializer # Anda perlu membuat serializer ini
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def ship(self, request, pk=None):
+        shipment = self.get_object()
+        if shipment.status != 'DRAFT':
+            return Response({'error': 'Only DRAFT shipments can be shipped.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Buat Stock Movement (Transfer)
+        for item in shipment.items.all():
+            # Keluar dari gudang asal
+            StockMovement.objects.create(
+                product=item.product, location=shipment.from_location, movement_type='TRANSFER_OUT',
+                quantity=-item.quantity, reference_number=shipment.shipment_number, user=request.user
+            )
+            # Masuk ke lokasi konsinyasi
+            StockMovement.objects.create(
+                product=item.product, location=shipment.to_consignment_location, movement_type='TRANSFER_IN',
+                quantity=item.quantity, reference_number=shipment.shipment_number, user=request.user
+            )
+        
+        shipment.status = 'SHIPPED'
+        shipment.shipped_by = request.user # Asumsi ada field ini
+        shipment.shipped_date = timezone.now() # Asumsi ada field ini
+        shipment.save()
+        return Response(self.get_serializer(shipment).data)
+
+class ConsignmentSalesReportViewSet(viewsets.ModelViewSet):
+    queryset = ConsignmentSalesReport.objects.all()
+    serializer_class = ConsignmentSalesReportSerializer # Anda perlu membuat serializer ini
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def confirm(self, request, pk=None):
+        report = self.get_object()
+        if report.status != 'DRAFT':
+            return Response({'error': 'Only DRAFT reports can be confirmed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        total_cogs = Decimal('0.00')
+        # 1. Buat Stock Movement (SALE) dari lokasi konsinyasi
+        for item in report.items.all():
+            StockMovement.objects.create(
+                product=item.product, location=report.consignment_location, movement_type='SALE',
+                quantity=-item.quantity_sold, reference_number=report.report_number, user=request.user
+            )
+            total_cogs += item.quantity_sold * (item.product.cost_price or 0)
+
+        # 2. Buat Jurnal Penjualan
+        ar_account = Account.objects.get(code='1-1200') # Piutang Usaha
+        sales_account = Account.objects.get(code='4-1000') # Pendapatan Penjualan
+        
+        journal_sales = JournalEntry.objects.create(
+            entry_date=report.report_date, entry_type='SALE',
+            description=f"Consignment Sales from report {report.report_number}",
+            created_by=request.user, total_debit=report.total_sales_amount, total_credit=report.total_sales_amount, status='POSTED'
+        )
+        JournalEntryLine.objects.create(journal_entry=journal_sales, account=ar_account, debit_amount=report.total_sales_amount)
+        JournalEntryLine.objects.create(journal_entry=journal_sales, account=sales_account, credit_amount=report.total_sales_amount)
+
+        # 3. Buat Jurnal HPP
+        cogs_account = Account.objects.get(code='5-1000') # HPP
+        inventory_account = Account.objects.get(code='1-1300') # Persediaan
+        
+        journal_cogs = JournalEntry.objects.create(
+            entry_date=report.report_date, entry_type='SALE_COGS',
+            description=f"COGS for Consignment Sales {report.report_number}",
+            created_by=request.user, total_debit=total_cogs, total_credit=total_cogs, status='POSTED'
+        )
+        JournalEntryLine.objects.create(journal_entry=journal_cogs, account=cogs_account, debit_amount=total_cogs)
+        JournalEntryLine.objects.create(journal_entry=journal_cogs, account=inventory_account, credit_amount=total_cogs)
+
+        # Update status laporan
+        report.status = 'CONFIRMED'
+        report.total_cogs_amount = total_cogs
+        report.save()
+        
+        # 4. Buat Invoice (opsional, tapi praktik yang baik)
+        Invoice.objects.create(
+            customer=report.customer, sales_order=None, # Tidak ada SO langsung
+            invoice_date=report.report_date, due_date=report.report_date + timedelta(days=30), # Asumsi Net 30
+            total_amount=report.total_sales_amount, status='PENDING',
+            notes=f"Auto-generated from Consignment Sales Report {report.report_number}"
+        )
+
+        return Response(self.get_serializer(report).data)

@@ -3,7 +3,8 @@ from django.urls import path, include
 from .views import (
     CustomerViewSet, CustomerGroupViewSet, SalesOrderViewSet, SalesOrderItemViewSet, 
     InvoiceViewSet, PaymentViewSet, ProductSearchViewSet,
-    DownPaymentViewSet, DownPaymentUsageViewSet, DeliveryOrderViewSet
+    DownPaymentViewSet, DownPaymentUsageViewSet, DeliveryOrderViewSet, SalesReturnViewSet,
+    ConsignmentShipmentViewSet, ConsignmentSalesReportViewSet
 )
 
 router = DefaultRouter()
@@ -15,6 +16,9 @@ router.register(r'invoices', InvoiceViewSet)
 router.register(r'payments', PaymentViewSet)
 router.register(r'products', ProductSearchViewSet, basename='sales-products')
 router.register(r'delivery-orders', DeliveryOrderViewSet)
+router.register(r'sales-returns', SalesReturnViewSet)
+router.register(r'consignment-shipments', ConsignmentShipmentViewSet)
+router.register(r'consignment-sales-reports', ConsignmentSalesReportViewSet)
 
 # Down Payment endpoints
 router.register(r'down-payments', DownPaymentViewSet)

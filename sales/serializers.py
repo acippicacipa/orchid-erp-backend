@@ -1,10 +1,15 @@
 from rest_framework import serializers
 from decimal import Decimal
 from django.db.models import Sum
-from .models import Customer, CustomerGroup, SalesOrder, SalesOrderItem, Invoice, Payment, DownPayment, DownPaymentUsage, DeliveryOrder
+from .models import (
+    Customer, CustomerGroup, SalesOrder, SalesOrderItem, Invoice, 
+    Payment, DownPayment, DownPaymentUsage, DeliveryOrder, SalesReturn, SalesReturnItem,
+    ConsignmentShipment, ConsignmentShipmentItem, ConsignmentSalesReport, ConsignmentSalesReportItem
+)
 from inventory.models import Product, Stock
+from inventory.serializers import ProductSerializer
 from django.utils import timezone
-from django.db import models
+from django.db import models, transaction
 
 class InvoicePrintItemSerializer(serializers.Serializer):
     """
@@ -503,3 +508,124 @@ class DeliveryOrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = DeliveryOrder
         fields = '__all__'
+
+class SalesReturnItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+
+    class Meta:
+        model = SalesReturnItem
+        fields = ['id', 'product', 'product_name', 'product_sku', 'quantity', 'unit_price', 'line_total']
+
+class SalesReturnSerializer(serializers.ModelSerializer):
+    items = SalesReturnItemSerializer(many=True)
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True, allow_null=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+    items_received_by_name = serializers.CharField(source='items_received_by.username', read_only=True)
+    return_location_name = serializers.CharField(source='return_location.name', read_only=True)
+
+    class Meta:
+        model = SalesReturn
+        fields = [
+            'id', 'return_number', 'customer', 'customer_name', 'return_date', 
+            'invoice', 'invoice_number', 'sales_order', 'status', 'total_amount', 
+            'reason', 'items_received_by_name', 'items_received_date', 
+            'return_location', 'return_location_name', 'created_by_name', 'items'
+        ]
+        read_only_fields = ['return_number', 'total_amount', 'created_by_name', 'items_received_by_name']
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop('items')
+        validated_data['created_by'] = self.context['request'].user
+        
+        sales_return = SalesReturn.objects.create(**validated_data)
+        
+        total_amount = Decimal('0.00')
+        for item_data in items_data:
+            item = SalesReturnItem.objects.create(sales_return=sales_return, **item_data)
+            total_amount += item.line_total
+        
+        sales_return.total_amount = total_amount
+        sales_return.save()
+        
+        return sales_return
+
+class ConsignmentShipmentItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+
+    class Meta:
+        model = ConsignmentShipmentItem
+        fields = ['id', 'product', 'product_name', 'product_sku', 'quantity']
+
+class ConsignmentShipmentSerializer(serializers.ModelSerializer):
+    items = ConsignmentShipmentItemSerializer(many=True)
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+    from_location_name = serializers.CharField(source='from_location.name', read_only=True)
+    to_consignment_location_name = serializers.CharField(source='to_consignment_location.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+
+    class Meta:
+        model = ConsignmentShipment
+        fields = [
+            'id', 'shipment_number', 'customer', 'customer_name', 'shipment_date',
+            'from_location', 'from_location_name', 'to_consignment_location', 
+            'to_consignment_location_name', 'status', 'notes', 'created_by_name', 
+            'created_at', 'items'
+        ]
+        read_only_fields = ['shipment_number', 'created_by_name']
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop('items')
+        validated_data['created_by'] = self.context['request'].user
+        
+        shipment = ConsignmentShipment.objects.create(**validated_data)
+        
+        for item_data in items_data:
+            ConsignmentShipmentItem.objects.create(shipment=shipment, **item_data)
+        
+        return shipment
+
+class ConsignmentSalesReportItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+
+    class Meta:
+        model = ConsignmentSalesReportItem
+        fields = ['id', 'product', 'product_name', 'product_sku', 'quantity_sold', 'unit_price', 'line_total']
+
+class ConsignmentSalesReportSerializer(serializers.ModelSerializer):
+    items = ConsignmentSalesReportItemSerializer(many=True)
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+    consignment_location_name = serializers.CharField(source='consignment_location.name', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.username', read_only=True)
+
+    class Meta:
+        model = ConsignmentSalesReport
+        fields = [
+            'id', 'report_number', 'customer', 'customer_name', 'report_date',
+            'consignment_location', 'consignment_location_name', 'status',
+            'total_sales_amount', 'total_cogs_amount', 'notes', 'created_by_name',
+            'created_at', 'items'
+        ]
+        read_only_fields = ['report_number', 'total_sales_amount', 'total_cogs_amount', 'created_by_name']
+
+    @transaction.atomic
+    def create(self, validated_data):
+        items_data = validated_data.pop('items')
+        validated_data['created_by'] = self.context['request'].user
+        
+        report = ConsignmentSalesReport.objects.create(**validated_data)
+        
+        total_amount = Decimal('0.00')
+        for item_data in items_data:
+            item = ConsignmentSalesReportItem.objects.create(report=report, **item_data)
+            total_amount += item.line_total
+        
+        report.total_sales_amount = total_amount
+        report.save()
+        
+        return report
