@@ -131,9 +131,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         if search:
             queryset = queryset.filter(
                 Q(name__icontains=search) | 
-                Q(sku__icontains=search) |
-                Q(description__icontains=search) |
-                Q(barcode__icontains=search)
+                Q(sku__icontains=search)
             )
         
         if main_category:
