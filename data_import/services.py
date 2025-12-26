@@ -6,7 +6,7 @@ from django.db import transaction
 from django.core.exceptions import ValidationError
 from django.contrib.auth.models import User
 from .models import ImportTemplate, DataImport, ImportErrorLog, ImportLog
-from inventory.models import Product, Stock, Location, MainCategory, SubCategory
+from inventory.models import Product, Stock, Location, MainCategory, SubCategory, StockMovement
 from sales.models import Customer, SalesOrder, SalesOrderItem, Invoice, Payment
 from purchasing.models import Supplier, PurchaseOrder, PurchaseOrderItem, Bill, SupplierPayment
 from accounting.models import Account, JournalEntry, JournalItem, Ledger
@@ -573,15 +573,31 @@ class DataImportService:
         location = Location.objects.get(code=row['warehouse_code'])
         quantity = row.get('quantity_on_hand', 0)
 
-        stock, created = Stock.objects.get_or_create(
+        unit_cost = product.cost_price or Decimal('0.00')
+
+        # stock, created = Stock.objects.get_or_create(
+        #     product=product,
+        #     location=location,
+        #     defaults={'quantity_on_hand': quantity, 'quantity_sellable': quantity}
+        # )
+        # if not created:
+        #     stock.quantity_on_hand = quantity
+        #     stock.quantity_sellable = quantity
+        #     stock.save()
+
+        StockMovement.objects.create(
             product=product,
             location=location,
-            defaults={'quantity_on_hand': quantity, 'quantity_sellable': quantity}
+            movement_type='ADJUSTMENT', # Gunakan tipe 'ADJUSTMENT' atau buat tipe baru 'INITIAL_STOCK'
+            quantity=quantity,
+            unit_cost=unit_cost,
+            reference_number=f"IMPORT-{self.data_import.id}", # Beri referensi yang jelas
+            notes=f"Initial stock import from file: {self.data_import.file.name}",
+            user=self.data_import.created_by, # Gunakan user yang mengunggah file
+            # Kita bisa set movement_date ke tanggal impor jika perlu
+            movement_date=self.data_import.created_at 
         )
-        if not created:
-            stock.quantity_on_hand = quantity
-            stock.quantity_sellable = quantity
-            stock.save()
+
         return True
     
     # Sales Order validation and import methods
