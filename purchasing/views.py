@@ -20,7 +20,7 @@ from decimal import Decimal
 from django_filters.rest_framework import DjangoFilterBackend
 
 class SupplierViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAdminOrPurchasing]
+    permission_classes = [IsAuthenticated]
     queryset = Supplier.objects.all()
     
     def get_serializer_class(self):
